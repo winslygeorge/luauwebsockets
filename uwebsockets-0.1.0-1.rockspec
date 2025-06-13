@@ -1,19 +1,14 @@
 -- uwebsockets-0.1.0-1.rockspec
--- The package name is now "uwebsockets" to directly match the luaopen_uwebsockets function.
+-- The package name is "uwebsockets" to directly match the luaopen_uwebsockets function.
 
-package = "uwebsockets" -- **CHANGED: Name now matches the C module's 'luaopen_uwebsockets' function**
+package = "uwebsockets"
 version = "0.1.0-1" -- Format: <library_version>-<rockspec_revision>
 
 -- The 'source' section tells LuaRocks where to download your project's source code.
--- **IMPORTANT:** This URL must point to a downloadable archive (e.g., .zip, .tar.gz)
--- that contains ALL your project files:
--- - build_deps.sh
--- - CMakeLists.txt
--- - src/shim.cpp
--- - The `src` directory containing your C++ source files.
+-- **UPDATED to your specified repository**
 source = {
-   url = "https://github.com/yourusername/your-luauwebsockets-repo/archive/v0.1.0.zip", -- **REPLACE THIS WITH YOUR ACTUAL PROJECT'S RELEASE/SOURCE URL**
-   dir = "your-luauwebsockets-repo-0.1.0" -- Adjust this if your archive extracts to a different directory name.
+   url = "https://github.com/winslygeorge/luauwebsockets/archive/master.zip", -- Assuming 'main' is your default branch and you'll create a release/archive from it
+   dir = "luauwebsockets-master" -- Adjust this if your archive extracts to a different directory name (e.g., based on a tag v0.1.0)
 }
 
 -- 'description' provides metadata about your library.
@@ -25,7 +20,7 @@ description = {
       servers or clients. It leverages uWebSockets' native C++ performance.
       Requires: require("uwebsockets")
    ]],
-   homepage = "https://github.com/yourusername/your-luauwebsockets-repo", -- **REPLACE WITH YOUR ACTUAL PROJECT'S HOMEPAGE/REPOSITORY URL**
+   homepage = "https://github.com/winslygeorge/luauwebsockets", -- **UPDATED to your specified repository**
    license = "MIT" -- Ensure this matches the license of your project.
 }
 
@@ -63,7 +58,7 @@ build = {
 
    -- 'install_command' contains the commands to execute during the installation phase.
    install_command = [[
-      -- Create the target directory for C modules if it doesn't already exist
+      -- Create the target directory for C modules if it doesn't exist
       mkdir -p "$(LIBDIR)"
       -- Copy the compiled shared library (from 'src/uwebsockets.so' as per CMakeLists.txt)
       -- to the LuaRocks C module installation directory ($(LIBDIR)).
