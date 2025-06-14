@@ -25,7 +25,7 @@ uws.get("/users/:id", function(req, res)
     local user_id = req:getUrl():match("/users/(%d+)") -- Simple regex to extract ID
     print("Received GET request for user ID:", user_id)
     res:writeHeader("Content-Type", "text/html")
-    res:send("<h1>User Profile</h1><p>You requested user ID: " .. tostring(user_id) .. "</p>")
+    res:sendHtml("<h1>User Profile</h1><p>You requested user ID: " .. tostring(user_id) .. "</p>")
 end)
 
 -- Another GET request example accessing headers and remote address
