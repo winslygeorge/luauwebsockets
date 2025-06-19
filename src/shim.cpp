@@ -24,8 +24,23 @@ namespace fs = std::filesystem; // Alias for convenience
 static std::shared_ptr<uWS::App> app;
 static lua_State *main_L = nullptr;
 static std::mutex lua_mutex;
-static std::unordered_map<int, int> lua_callbacks;
+static std::unordered_map<int, int> lua_callbacks; // For general route callbacks
 static int callback_id_counter = 0;
+
+// --- SSE Specific Global State ---
+// Map to store active SSE connections, identified by a unique ID
+// Maps a generated SSE_ID to a shared_ptr to the HttpResponse object and the associated Lua callback ref
+struct SseConnection {
+    uWS::HttpResponse<false>* res; // Raw pointer, managed by uWS lifecycle
+    int lua_ref; // Lua reference to the callback to send data
+    bool is_aborted; // Flag to track if connection has been aborted
+};
+// Use a map to store active SSE connections for easy lookup and management
+static std::unordered_map<std::string, std::shared_ptr<SseConnection>> active_sse_connections;
+static std::mutex sse_connections_mutex; // Mutex for active_sse_connections map
+
+// Function to generate a simple unique ID (re-using from original file)
+std::string generate_unique_id(); // Forward declaration for use in uw_sse
 
 struct DummyUserData {};
 
@@ -68,6 +83,16 @@ int create_res_userdata(lua_State *L, uWS::HttpResponse<false>* res) {
 
     return 1;
 }
+
+// New: create_sse_res_userdata - A distinct userdata for SSE responses
+int create_sse_res_userdata(lua_State *L, uWS::HttpResponse<false>* res, const std::string& sse_id) {
+    // We'll push a string ID to Lua, so Lua can call uw_sse_send with the ID
+    lua_pushstring(L, sse_id.c_str());
+    // Optionally, if you wanted a userdata for SSE, it would hold the ID, not the res pointer directly
+    // For now, let's just pass the ID as a string, simpler for Lua to manage.
+    return 1; // Pushed one value (the SSE ID string)
+}
+
 
 static int res_writeStatus(lua_State *L) {
     uWS::HttpResponse<false>** res = (uWS::HttpResponse<false>**)luaL_checkudata(L, 1, "res");
@@ -112,7 +137,7 @@ static int websocket_send(lua_State *L) {
     }
     uWS::WebSocket<false, true, WebSocketUserData>* ws = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
     const char *message = luaL_checkstring(L, 2);
-    size_t len = lua_objlen(L, 2);
+    size_t len = lua_objlen(L, 2); // Correct way to get length for string
     uWS::OpCode opCodeToSend = uWS::OpCode::TEXT; // Default to text
 
     if (lua_gettop(L) > 2 && lua_isstring(L, 3)) {
@@ -325,31 +350,31 @@ int uw_post(lua_State *L) {
 
     app->post(route, [callback_id, route](uWS::HttpResponse<false> *res_uws, uWS::HttpRequest *req_uws) {
         // std::cerr << "uw_post handler called. res_uws: " << res_uws << ", req_uws: " << req_uws << std::endl;
-if(res_uws){
-        res_uws->onData([callback_id, res_uws, req_uws, route](std::string_view data, bool last) mutable {
-            std::lock_guard<std::mutex> lock(lua_mutex);
-            if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
+        if(res_uws){
+            res_uws->onData([callback_id, res_uws, req_uws, route](std::string_view data, bool last) mutable {
+                std::lock_guard<std::mutex> lock(lua_mutex);
+                if (!execute_middleware(main_L, res_uws, req_uws, route)) return;
 
-            lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
-            create_req_userdata(main_L, req_uws);
-            create_res_userdata(main_L, res_uws);
-            lua_pushlstring(main_L, data.data(), data.size());
-            lua_pushboolean(main_L, last);
+                lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+                create_req_userdata(main_L, req_uws);
+                create_res_userdata(main_L, res_uws);
+                lua_pushlstring(main_L, data.data(), data.size());
+                lua_pushboolean(main_L, last);
 
-            if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
-                std::cerr << "Lua error in POST handler: " << lua_tostring(main_L, -1) << std::endl;
-                lua_pop(main_L, 1);
-                res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
-            }
-        });
+                if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+                    std::cerr << "Lua error in POST handler: " << lua_tostring(main_L, -1) << std::endl;
+                    lua_pop(main_L, 1);
+                    res_uws->writeHeader("Content-Type", "text/plain")->end("Internal Server Error");
+                }
+            });
 
-        res_uws->onAborted([]() {
-            std::cerr << "POST request aborted" << std::endl;
-        });
+            res_uws->onAborted([]() {
+                std::cerr << "POST request aborted" << std::endl;
+            });
 
-}else{
-        std::cerr << "Error: res_uws is NULL in POST handler!" << std::endl;
-}
+        }else{
+            std::cerr << "Error: res_uws is NULL in POST handler!" << std::endl;
+        }
     });
     lua_pushboolean(L, 1);
     return 1;
@@ -377,7 +402,7 @@ int uw_put(lua_State *L) {
                     lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
                     create_req_userdata(main_L, req_uws);
                     create_res_userdata(main_L, res_uws);
-                     lua_pushlstring(main_L, data.data(), data.size());
+                    lua_pushlstring(main_L, data.data(), data.size()); // This passes the *last* chunk, not the full body
                     lua_pushboolean(main_L, last);
 
                     if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
@@ -628,14 +653,6 @@ int uw_ws(lua_State *L) {
     return 1;
 }
 
-// Assuming fs, app, and other necessary includes/definitions are present
-// Assuming you have uWebSockets.h or similar for uWS::App and Response/Request types
-// #include "uWebSockets.h"
-
-// Assuming 'app' is globally available, e.g.:
-// uWS::App* app = nullptr;
-// namespace fs = std::filesystem; // Alias for std::filesystem
-
 // Helper function to get MIME type (assuming it's correct)
 std::string get_mime_type(const std::string& filepath) {
     fs::path p(filepath);
@@ -790,6 +807,151 @@ int uw_serve_static(lua_State *L) {
     lua_pushboolean(L, 1);
     return 1;
 }
+
+// --- SSE Implementation ---
+
+// Lua callable function to send an SSE event
+// Expected usage: uwebsockets.sse_send(sse_id, data, event_name_optional, id_optional)
+int uw_sse_send(lua_State *L) {
+    const char* sse_id = luaL_checkstring(L, 1);
+    const char* data = luaL_checkstring(L, 2);
+    const char* event_name = lua_isstring(L, 3) ? luaL_checkstring(L, 3) : nullptr;
+    const char* id = lua_isstring(L, 4) ? luaL_checkstring(L, 4) : nullptr;
+
+    std::lock_guard<std::mutex> lock(sse_connections_mutex); // Lock access to the map
+
+    auto it = active_sse_connections.find(sse_id);
+    if (it == active_sse_connections.end() || it->second->is_aborted) {
+        std::cerr << "SSE Connection with ID '" << sse_id << "' not found or aborted. Cannot send message." << std::endl;
+        lua_pushboolean(L, 0); // Indicate failure
+        lua_pushstring(L, "SSE connection not found or aborted.");
+        return 2;
+    }
+
+    uWS::HttpResponse<false>* res = it->second->res;
+
+    // Construct the SSE message
+    std::string sse_message;
+    if (id) {
+        sse_message += "id: ";
+        sse_message += id;
+        sse_message += "\n";
+    }
+    if (event_name) {
+        sse_message += "event: ";
+        sse_message += event_name;
+        sse_message += "\n";
+    }
+    sse_message += "data: ";
+    sse_message += data;
+    sse_message += "\n\n"; // Two newlines to terminate the event
+
+    res->write(sse_message); // Send the data
+
+    lua_pushboolean(L, 1); // Indicate success
+    return 1;
+}
+
+// Lua callable function to close an SSE connection
+// Expected usage: uwebsockets.sse_close(sse_id)
+int uw_sse_close(lua_State *L) {
+    const char* sse_id = luaL_checkstring(L, 1);
+
+    std::lock_guard<std::mutex> lock(sse_connections_mutex);
+
+    auto it = active_sse_connections.find(sse_id);
+    if (it != active_sse_connections.end()) {
+        if (!it->second->is_aborted) {
+            it->second->res->end(); // Gracefully close the HTTP response
+            it->second->is_aborted = true; // Mark as aborted
+            // The onAborted callback will handle removal from the map
+            std::cout << "SSE Connection with ID '" << sse_id << "' explicitly closed by Lua." << std::endl;
+        } else {
+            std::cout << "SSE Connection with ID '" << sse_id << "' already aborted/closed." << std::endl;
+        }
+        lua_pushboolean(L, 1); // Indicate success (or that it was already closed)
+        return 1;
+    } else {
+        std::cerr << "SSE Connection with ID '" << sse_id << "' not found for closing." << std::endl;
+        lua_pushboolean(L, 0); // Indicate failure
+        lua_pushstring(L, "SSE connection not found.");
+        return 2;
+    }
+}
+
+
+// Lua callable function to set up an SSE route
+// Expected usage: uwebsockets.sse("/my-events", function(req, sse_conn_id) ... end)
+// The Lua callback receives req and the sse_conn_id (string) to manage the connection.
+int uw_sse(lua_State *L) {
+    const char *route = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2); // Push the Lua callback function onto the stack
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX); // Get a reference to the Lua function
+
+    app->get(route, [ref, route](uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        if (!execute_middleware(main_L, res, req, route)) {
+            // If middleware aborts, ensure the response is ended and headers not set for SSE
+            res->writeStatus("403 Forbidden")->end("Forbidden by middleware");
+            return;
+        }
+
+        // Generate a unique ID for this SSE connection
+        std::string sse_id = generate_unique_id();
+        std::cout << "New SSE connection established: " << sse_id << " for route: " << route << std::endl;
+
+        // Set SSE specific headers
+        res->writeHeader("Content-Type", "text/event-stream");
+        res->writeHeader("Cache-Control", "no-cache");
+        res->writeHeader("Connection", "keep-alive");
+        // Optional: CORS headers if needed
+        // res->writeHeader("Access-Control-Allow-Origin", "*");
+
+        // Store the SseConnection in the global map
+        auto sse_conn = std::make_shared<SseConnection>();
+        sse_conn->res = res;
+        sse_conn->lua_ref = ref; // The same Lua callback ref for all connections to this route
+        sse_conn->is_aborted = false;
+
+        {
+            std::lock_guard<std::mutex> map_lock(sse_connections_mutex);
+            active_sse_connections[sse_id] = sse_conn;
+        }
+
+        // Set up onAborted callback to clean up when client disconnects
+        res->onAborted([sse_id, sse_conn]() {
+            std::lock_guard<std::mutex> map_lock(sse_connections_mutex);
+            std::cerr << "SSE connection aborted: " << sse_id << std::endl;
+            sse_conn->is_aborted = true; // Mark as aborted
+            active_sse_connections.erase(sse_id); // Remove from map
+            // Note: The Lua ref (ref) is only removed when the module shuts down
+            // or if we were to decrement its ref count here (luaL_unref)
+            // For now, assume a single ref for the route's handler.
+        });
+
+        // Call the Lua callback to signal that a new SSE connection is ready
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, ref); // Push the Lua callback
+        create_req_userdata(main_L, req);            // Push req userdata
+        create_sse_res_userdata(main_L, res, sse_id); // Push the SSE connection ID
+
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) {
+            std::cerr << "Lua error in SSE route handler (initial call): " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1);
+            // If the Lua handler fails, close the SSE connection
+            res->end();
+            {
+                std::lock_guard<std::mutex> map_lock(sse_connections_mutex);
+                active_sse_connections.erase(sse_id);
+            }
+        }
+        // IMPORTANT: Do NOT call res->end() here. The connection must stay open for SSE.
+    });
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 int uw_listen(lua_State *L) {
     if (!app) {
         std::cerr << "Error: uWS::App not initialized." << std::endl;
@@ -832,10 +994,13 @@ extern "C" int luaopen_uwebsockets(lua_State *L) {
         {"head", uw_head},
         {"options", uw_options},
         {"ws", uw_ws},
+        {"sse", uw_sse},             // New SSE route function
+        {"sse_send", uw_sse_send},   // New function to send SSE data
+        {"sse_close", uw_sse_close}, // New function to close SSE connection
         {"listen", uw_listen},
         {"run", uw_run},
         {"use", uw_use},
-        {"serve_static", uw_serve_static}, // Add the new function
+        {"serve_static", uw_serve_static},
         {nullptr, nullptr}
     };
 
