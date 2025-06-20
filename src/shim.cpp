@@ -53,6 +53,43 @@ struct Middleware {
 
 static std::vector<Middleware> middlewares;
 
+struct LuaTimerData {
+    lua_State* owner;
+    lua_State* thread;
+    int lua_ref;
+    int timer_id;
+    bool is_interval;
+    bool is_cleared;
+    std::vector<int> arg_refs; // <-- Add this line to store arguments
+};
+
+
+
+std::unordered_map<int, us_timer_t*> active_timers;
+int timer_id_counter = 0;
+
+// Helper to get app pointer for uWS::Loop
+uWS::Loop *get_uWS_Loop() {
+    // This is a bit of a hack, but uWS::Loop::get() returns the global loop instance.
+    // The C++ uWS library is a wrapper around libusockets, and their Loop
+    // object generally contains or is directly compatible with us_loop_t.
+    // We assume the uWS::Loop* can be cast to us_loop_t* for libusockets functions.
+    // This assumes uWS::Loop is essentially us_loop_t with C++ sugar.
+    return uWS::Loop::get();
+}
+
+
+// Helper to push Lua table from C++ map
+void push_map_to_lua(lua_State* L, const std::unordered_map<std::string, std::string>& m) {
+    lua_newtable(L);
+    for (const auto& pair : m) {
+        lua_pushstring(L, pair.first.c_str());
+        lua_pushstring(L, pair.second.c_str());
+        lua_settable(L, -3);
+    }
+}
+
+
 int uw_create_app(lua_State *L) {
     if (!app) {
         app = std::make_shared<uWS::App>();
@@ -122,6 +159,286 @@ static int res_closeConnection(lua_State *L) {
     (*res)->close();
     return 0;
 }
+
+// Function to call a Lua callback with optional arguments
+void call_lua_callback(int lua_ref, int num_args, std::function<void(lua_State*)> push_args) {
+    std::lock_guard<std::mutex> lock(lua_mutex);
+    lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_ref);
+    if (lua_isfunction(main_L, -1)) {
+        push_args(main_L);
+        if (lua_pcall(main_L, num_args, 0, 0) != LUA_OK) {
+            std::cerr << "Error calling Lua callback: " << lua_tostring(main_L, -1) << std::endl;
+        }
+    } else {
+        std::cerr << "Lua callback reference is not a function." << std::endl;
+        lua_pop(main_L, 1); // Pop the non-function value
+    }
+}
+
+
+// --- Timer functions ---
+
+// --- Timer functions ---
+
+void libus_timer_callback(struct us_timer_t *timer) {
+    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
+    if (!data || data->is_cleared) {
+        if (data) {
+            // us_timer_close(timer);
+            active_timers.erase(data->timer_id);
+        }
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(lua_mutex);
+
+    lua_State* L = data->thread;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push Lua function
+
+    if (!lua_isfunction(L, -1)) {
+        std::cerr << "[TimerCallback] Timer ID " << data->timer_id << ": not a function\n";
+        lua_pop(L, 1);
+        return;
+    }
+
+    // Push context table(s) from arg_refs
+    int arg_count = 0;
+    for (int ref : data->arg_refs) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref); // push context table or additional args
+        ++arg_count;
+    }
+
+    int status = lua_resume(L, arg_count);
+
+    if (status != LUA_OK && status != LUA_YIELD) {
+        const char* err = lua_tostring(L, -1);
+        std::cerr << "[TimerCallback] Timer ID " << data->timer_id << " error: "
+                  << (err ? err : "unknown") << "\n";
+        lua_pop(L, 1); // remove error message
+    }
+
+    if (!data->is_interval) {
+        // One-time timeout: clean everything
+        data->is_cleared = true;
+
+        luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
+        for (int ref : data->arg_refs) {
+            luaL_unref(data->owner, LUA_REGISTRYINDEX, ref);
+        }
+
+        // us_timer_close(timer);
+        active_timers.erase(data->timer_id);
+    }
+}
+
+
+
+// void libus_timer_callback(struct us_timer_t *timer) {
+//     LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
+//     if (!data || data->is_cleared) {
+//         if (data) {
+//             us_timer_close(timer);
+//             active_timers.erase(data->timer_id);
+//         }
+//         return;
+//     }
+
+//     std::lock_guard<std::mutex> lock(lua_mutex);
+
+//     if (data->is_interval) {
+//         // INTERVAL: create new coroutine, run stored function
+//         lua_State* thread = lua_newthread(data->owner);
+//         lua_rawgeti(thread, LUA_REGISTRYINDEX, data->lua_ref);
+//         if (!lua_isfunction(thread, -1)) {
+//             std::cerr << "[TimerCallback] Interval ref is not function\n";
+//             lua_pop(thread, 1);
+//             return;
+//         }
+
+//         int status = lua_resume(thread, 0);
+//         if (status != LUA_OK && status != LUA_YIELD) {
+//             std::cerr << "[TimerCallback] Interval error: " << (lua_isstring(thread, -1) ? lua_tostring(thread, -1) : "unknown") << "\n";
+//             lua_pop(thread, 1);
+//         }
+
+//     } else {
+//         // TIMEOUT: resume coroutine once
+//         lua_rawgeti(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
+
+//         if (!lua_isfunction(data->owner, -1)) {
+//             std::cerr << "[TimerCallback] Timeout ref is not function\n";
+//             lua_pop(data->owner, 1);
+//             return;
+//         }
+//         int status = lua_resume(data->owner, 0);
+//         if (status != LUA_OK && status != LUA_YIELD) {
+//             std::cerr << "[TimerCallback] Timeout error: " << (lua_isstring(data->owner, -1) ? lua_tostring(data->owner, -1) : "unknown") << "\n";
+//             lua_pop(data->owner, 1);
+//         }
+
+//         data->is_cleared = true;
+//         luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
+//         active_timers.erase(data->timer_id);
+//     }
+// }
+
+
+
+
+
+
+// --- Timer functions ---
+
+
+
+// --- Timer functions ---
+int uw_setTimeout(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    long long delay_ms = luaL_checkinteger(L, 2);
+    int nargs = lua_gettop(L) - 2;
+
+    std::lock_guard<std::mutex> lock(lua_mutex);
+
+    int timer_id = timer_id_counter++;
+
+    lua_State* thread = lua_newthread(L);
+    lua_pushvalue(L, 1);           // Push the function
+    lua_xmove(L, thread, 1);       // Move to new thread
+    int fn_ref = luaL_ref(thread, LUA_REGISTRYINDEX);
+
+    us_loop_t* loop = (us_loop_t *)uWS::Loop::get();
+    us_timer_t* timer = us_create_timer(loop, 1, sizeof(LuaTimerData));
+    if (!timer) {
+        luaL_unref(thread, LUA_REGISTRYINDEX, fn_ref);
+        lua_pushnil(L);
+        return 1;
+    }
+
+    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
+    memset(data, 0, sizeof(LuaTimerData));
+    data->thread = thread;
+    data->owner = thread;
+    data->lua_ref = fn_ref;
+    data->timer_id = timer_id;
+    data->is_interval = false;
+    data->is_cleared = false;
+
+    // Create context table
+    lua_newtable(L);                                  // ctx
+    lua_pushstring(L, "id"); lua_pushinteger(L, timer_id); lua_settable(L, -3);
+    lua_pushstring(L, "type"); lua_pushstring(L, "timeout"); lua_settable(L, -3);
+    lua_pushstring(L, "delay_ms"); lua_pushinteger(L, delay_ms); lua_settable(L, -3);
+
+    // Capture additional arguments
+    if (nargs > 0) {
+        lua_pushstring(L, "args");
+        lua_newtable(L);  // args table
+        for (int i = 0; i < nargs; i++) {
+            lua_pushinteger(L, i + 1);
+            lua_pushvalue(L, 3 + i);
+            lua_settable(L, -3);
+        }
+        lua_settable(L, -3); // ctx.args = { ... }
+    }
+
+    data->arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));  // ref to ctx table
+
+    us_timer_set(timer, libus_timer_callback, delay_ms, 0);
+    active_timers[timer_id] = timer;
+
+    lua_pushinteger(L, timer_id);
+    return 1;
+}
+
+
+int uw_setInterval(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    long long interval_ms = luaL_checkinteger(L, 2);
+    int nargs = lua_gettop(L) - 2;
+
+    std::lock_guard<std::mutex> lock(lua_mutex);
+
+    int timer_id = timer_id_counter++;
+
+    lua_State* thread = lua_newthread(L); // Isolated coroutine
+    lua_pushvalue(L, 1);                  // Push function
+    lua_xmove(L, thread, 1);              // Move to new thread
+    int fn_ref = luaL_ref(thread, LUA_REGISTRYINDEX); // Ref in new thread
+
+    us_loop_t* loop = (us_loop_t *)uWS::Loop::get();
+    us_timer_t* timer = us_create_timer(loop, 1, sizeof(LuaTimerData));
+    if (!timer) {
+        luaL_unref(thread, LUA_REGISTRYINDEX, fn_ref);
+        lua_pushnil(L);
+        return 1;
+    }
+
+    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
+    memset(data, 0, sizeof(LuaTimerData));
+    data->owner = thread;
+    data->thread = thread;
+    data->lua_ref = fn_ref;
+    data->timer_id = timer_id;
+    data->is_interval = true;
+    data->is_cleared = false;
+
+    // Build ctx table
+    lua_newtable(L);                                  // ctx
+    lua_pushstring(L, "id"); lua_pushinteger(L, timer_id); lua_settable(L, -3);
+    lua_pushstring(L, "type"); lua_pushstring(L, "interval"); lua_settable(L, -3);
+    lua_pushstring(L, "interval_ms"); lua_pushinteger(L, interval_ms); lua_settable(L, -3);
+
+    if (nargs > 0) {
+        lua_pushstring(L, "args");
+        lua_newtable(L);
+        for (int i = 0; i < nargs; i++) {
+            lua_pushinteger(L, i + 1);
+            lua_pushvalue(L, 3 + i);
+            lua_settable(L, -3);
+        }
+        lua_settable(L, -3); // ctx.args = { ... }
+    }
+
+    data->arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX)); // ref ctx table in main state (L)
+
+    us_timer_set(timer, libus_timer_callback, interval_ms, interval_ms);
+    active_timers[timer_id] = timer;
+
+    std::cout << "[setInterval] Created isolated interval ID: " << timer_id << "\n";
+
+    lua_pushinteger(L, timer_id);
+    return 1;
+}
+
+
+
+
+
+int uw_clearTimer(lua_State *L) {
+    int timer_id = luaL_checkinteger(L, 1);
+
+    std::lock_guard<std::mutex> lock(lua_mutex);
+    auto it = active_timers.find(timer_id);
+    if (it != active_timers.end()) {
+        us_timer_t* timer = it->second;
+        LuaTimerData *data = (LuaTimerData *)us_timer_ext(timer);
+        if (data && !data->is_cleared) {
+            data->is_cleared = true;
+            luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
+            us_timer_set(timer, nullptr, 0, 0);  // Disarm before closing
+            us_timer_close(timer);
+        }
+        active_timers.erase(it);
+        std::cout << "[clearTimer] Cleared timer ID: " << timer_id << "\n";
+        lua_pushboolean(L, 1);
+    } else {
+        std::cerr << "[clearTimer] Timer ID " << timer_id << " not found.\n";
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
 
 
 // User data structure for WebSocket
@@ -981,6 +1298,15 @@ int uw_run(lua_State *L) {
     return 0;
 }
 
+int uw_cleanup_app(lua_State *L) {
+    if (app) {
+        std::cout << "Explicitly resetting uWS::App shared_ptr.\n";
+        app.reset(); // This will call the destructor of uWS::App
+    }
+    main_L = nullptr; // Reset main_L if needed
+    return 0;
+}
+
 extern "C" int luaopen_uwebsockets(lua_State *L) {
     create_metatables(L);
 
@@ -1001,6 +1327,12 @@ extern "C" int luaopen_uwebsockets(lua_State *L) {
         {"run", uw_run},
         {"use", uw_use},
         {"serve_static", uw_serve_static},
+        {"setTimeout", uw_setTimeout},
+        {"setInterval", uw_setInterval},
+        {"clearTimer", uw_clearTimer},
+        {"cleanup_app", uw_cleanup_app}, // Add this new function
+
+        // {"add_timer", uw_add_timer}, // This function was not defined in the provided shim.cpp
         {nullptr, nullptr}
     };
 

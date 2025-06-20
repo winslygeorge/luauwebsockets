@@ -1,132 +1,76 @@
-local uws = require("uwebsockets")
+local app = require("uwebsockets")
+local json = require("dkjson")
 
-uws.create_app()
+app.create_app()
 
--- Simple counter for SSE events
-local sse_event_counter = 0
+ -- Using 1000ms for a quicker test
 
--- Store active SSE IDs if you need to broadcast or manage them
-local active_sse_clients = {}
+  -- Set a interval_id to print a message after 3000ms
+    -- This will not block the app loop, allowing it to continue processing other requests
+    print("Setting a timeout for 3000 milliseconds...")
 
--- Define an SSE route
-uws.sse("/events", function(req, sse_id)
-    print("New SSE client connected! ID: " .. sse_id)
-    print("Request URL:", req:getUrl())
+    app.setTimeout(function()
+        print("Timeout reached after 3000 milliseconds!")
+    end, 3000)
 
-    -- Add the client ID to our list of active clients
-    active_sse_clients[sse_id] = true
+    app.setTimeout(function(msg)
+    print("Timeout:", msg)
+end, 1000, "Hello!")
 
-    -- Send an initial event
-    uws.sse_send(sse_id, "Welcome!", "welcome", "1")
+app.setInterval(function(ctx)
+    print("Tick:", ctx.args[1], ctx.args[2])
+end, 2000, "Tick message", 42)
 
-    -- Example: Periodically send updates
-    -- In a real application, you'd trigger this based on actual events
-    -- For demonstration, let's just send some updates
-    local function send_updates()
-        if active_sse_clients[sse_id] then -- Check if connection is still active
-            sse_event_counter = sse_event_counter + 1
-            local message = "Current server time: " .. os.date() .. " (Event #" .. sse_event_counter .. ")"
-            local event_id = tostring(sse_event_counter)
 
-            local success, err = uws.sse_send(sse_id, message, "update", event_id)
-            if not success then
-                print("Failed to send SSE message to " .. sse_id .. ": " .. err)
-                active_sse_clients[sse_id] = nil -- Remove if send failed
-                -- You might want to close the connection here if it's dead
-                -- uws.sse_close(sse_id) -- Or let client disconnection handle it
-            else
-                -- Schedule next update
-                -- This part is illustrative. Lua itself doesn't have a built-in event loop
-                -- for timers. You'd typically integrate with uWS's event loop or
-                -- another library for timers if you need server-side pushes.
-                -- For now, this is just to show how you'd call sse_send.
-                -- In a true event-driven system, `send_updates` would be called externally
-                -- when new data is available.
-            end
-        else
-            print("SSE client " .. sse_id .. " is no longer active.")
-        end
-    end
 
-    -- In a real system, you'd likely register a timer or an event listener
-    -- here that calls `send_updates` when data changes.
-    -- For this simple example, let's simulate a few immediate sends.
-    send_updates()
-    send_updates()
-    send_updates()
 
-    -- You can also close the connection from Lua when done
-    -- uws.sse_close(sse_id)
+-- define setInterval to print a message every 1000ms
+local count = 0
+
+app.setInterval(function(ctx)
+    print("Interval ID:", ctx.id)
+    print("Type:", ctx.type)
+    print("Interval (ms):", ctx.interval_ms)
+
+    local args = ctx.args or {}
+    local var3 = json.encode(args[3]) or "nil"
+    print("Extra args:", args[1], args[2], var3)
+
+    count = (count or 0) + 1
+    -- if count >= 10 then
+    --     app.clearTimer(ctx.id)
+    --     print("Interval cleared.")
+    -- end
+end, 1000, "hello", 123, { key = "value" })
+
+
+
+-- app.clearInterval() -- Clear the interval after 5 seconds
+
+app.get("/hello", function(req, res)
+    res:writeHeader("Content-Type", "text/plain")
+    print("Received GET request for /hello")
+    res:send('Hello, World! This is a response from the uWebSockets app.\n')
+
 end)
 
--- Serve a basic HTML file to demonstrate SSE client
-uws.get("/", function(req, res)
-    res:writeHeader("Content-Type", "text/html")
-    res:send([[
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>SSE Test</title>
-        </head>
-        <body>
-            <h1>Server-Sent Events Demo</h1>
-            <div id="events"></div>
-            <script>
-                const eventSource = new EventSource('/events');
 
-                eventSource.onopen = function() {
-                    document.getElementById('events').innerHTML += '<p style="color: green;">Connection opened!</p>';
-                };
 
-                eventSource.onmessage = function(event) {
-                    const p = document.createElement('p');
-                    p.textContent = `[Default Message] Data: ${event.data}, Last Event ID: ${event.lastEventId}`;
-                    document.getElementById('events').appendChild(p);
-                };
-
-                eventSource.addEventListener('welcome', function(event) {
-                    const p = document.createElement('p');
-                    p.style.fontWeight = 'bold';
-                    p.textContent = `[Welcome Event] Data: ${event.data}, Last Event ID: ${event.lastEventId}`;
-                    document.getElementById('events').appendChild(p);
-                });
-
-                eventSource.addEventListener('update', function(event) {
-                    const p = document.createElement('p');
-                    p.style.color = 'blue';
-                    p.textContent = `[Update Event] Data: ${event.data}, Last Event ID: ${event.lastEventId}`;
-                    document.getElementById('events').appendChild(p);
-                });
-
-                eventSource.onerror = function(event) {
-                    console.error('EventSource error:', event);
-                    document.getElementById('events').innerHTML += '<p style="color: red;">Connection error!</p>';
-                    eventSource.close();
-                };
-
-                // Example of sending an event from the client side (not directly related to SSE but common)
-                // fetch('/api/some-action', { method: 'POST', body: '...' });
-            </script>
-        </body>
-        </html>
-    ]])
-end)
-
--- Example of an API endpoint that might trigger an SSE broadcast (conceptual)
-uws.post("/broadcast", function(req, res, data, last)
-    if last then
-        print("Received broadcast request: ", data)
-        for sse_id, _ in pairs(active_sse_clients) do
-            local success, err = uws.sse_send(sse_id, "Broadcast from API: " .. data, "api_broadcast")
-            if not success then
-                print("Failed to broadcast to " .. sse_id .. ": " .. err)
-                -- Consider removing the client from active_sse_clients here if it consistently fails
-            end
-        end
-        res:send("Broadcast initiated!")
+app.listen(3000, function(token)
+    if token then
+        print("Listening on port 3000")
+    else
+        print("Failed to listen on port 3000")
     end
 end)
 
 
-uws.listen(3000)
-uws.run()
+
+
+print("Running uWS application loop. Press Ctrl+C to exit.")
+app.run() -- This blocks until the app loop is stopped (e.g., by Ctrl+C)
+
+-- After app:run() returns, explicitly clean up the uWS app
+print("App loop has ended. Initiating graceful cleanup...")
+-- app.cleanup_app() -- Call your new cleanup function
+print("Cleanup initiated. Program should now exit cleanly.")

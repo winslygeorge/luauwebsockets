@@ -4,6 +4,10 @@ project(uwebsockets_lua_binding LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Set debug flags for C++ compiler
+# This adds -g to CXX_FLAGS when building in Debug mode
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
+
 # Add your source
 add_library(uwebsockets SHARED src/shim.cpp)
 

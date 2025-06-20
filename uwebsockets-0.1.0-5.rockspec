@@ -1,8 +1,8 @@
--- uwebsockets-0.1.0-2.rockspec
+-- uwebsockets-0.1.0-5.rockspec
 -- The package name is "uwebsockets" to directly match the luaopen_uwebsockets function.
 
 package = "uwebsockets"
-version = "0.1.0-2" -- Format: <library_version>-<rockspec_revision>
+version = "0.1.0-5" -- Format: <library_version>-<rockspec_revision>
 
 -- The 'source' section tells LuaRocks where to download your project's source code.
 source = {
@@ -37,7 +37,7 @@ build = {
    build_command = [[
       chmod +x build_deps.sh
       ./build_deps.sh
-      cmake .
+      cmake . -DCMAKE_BUILD_TYPE=Debug
       make
    ]],
 
