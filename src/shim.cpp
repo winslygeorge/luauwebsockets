@@ -1269,6 +1269,269 @@ int uw_sse(lua_State *L) {
     return 1;
 }
 
+// file operation functions
+
+// Global mutex to protect Lua state access from multiple threads
+// IMPORTANT: In a real application, you might want a more sophisticated
+// threading model or use Lua's built-in coroutines for asynchronous operations
+// if direct OS threads are not strictly necessary or if you need to
+// avoid locking the entire Lua state for extended periods.
+// static std::mutex lua_mutex;
+
+// Pointer to the main Lua state. This should be set once at initialization.
+// Ensure main_L is valid and accessible from the worker threads.
+// For example, you might set it in your Lua initialization function:
+// extern lua_State* main_L; // Declare it somewhere accessible
+// lua_State* main_L = nullptr; // Initialize it appropriately
+
+// Helper function to push error messages to Lua
+static void push_error_to_lua(lua_State* L, const std::string& message) {
+    lua_pushnil(L); // First return value is nil for error
+    lua_pushstring(L, message.c_str()); // Second return value is the error message
+}
+
+// Helper function to push success results to Lua
+static void push_success_to_lua(lua_State* L, const std::string& content) {
+    lua_pushlstring(L, content.data(), content.size()); // The content
+    lua_pushnil(L); // No error message
+}
+
+// Helper function to push boolean success results to Lua
+static void push_bool_result_to_lua(lua_State* L, bool success) {
+    lua_pushboolean(L, success); // True for success, false for failure
+    lua_pushnil(L); // No error message initially
+}
+
+// file operation functions
+
+int uw_async_read_file(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    lua_pushvalue(L, 2); // Push the callback function
+    int cb_ref = luaL_ref(L, LUA_REGISTRYINDEX); // Store a reference to the callback
+
+    // Create copies of data needed in the thread to avoid dangling pointers
+    std::string path_copy = path;
+
+    // Detach the thread to run independently.
+    // Consider using a thread pool or managing threads if you expect many concurrent operations
+    // to avoid resource exhaustion from too many detached threads.
+    std::thread([path_copy, cb_ref]() {
+        std::string content;
+        std::string error_message; // To store any error during file operation
+
+        // Use std::ios::ate to seek to the end and get file size, then seek back
+        // This is a common way to pre-allocate buffer for efficiency with known file size.
+        // Or simply read byte by byte if file size is unknown or can be very large.
+        std::ifstream file(path_copy, std::ios::binary | std::ios::ate);
+
+        if (file.is_open()) {
+            std::streampos file_size = file.tellg(); // Get file size
+            file.seekg(0, std::ios::beg); // Seek back to beginning
+
+            // Read the entire file content into the string
+            // For very large files, consider reading in chunks to avoid excessive memory usage.
+            try {
+                content.reserve(file_size); // Pre-allocate memory
+                content.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            } catch (const std::bad_alloc& e) {
+                error_message = "Memory allocation failed for file content: " + std::string(e.what());
+            } catch (const std::exception& e) {
+                error_message = "Error reading file content: " + std::string(e.what());
+            }
+
+            file.close(); // Explicitly close the file
+        } else {
+            error_message = "Failed to open file for reading: " + path_copy;
+        }
+
+        // Acquire lock before interacting with the Lua state
+        std::lock_guard<std::mutex> lock(lua_mutex);
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, cb_ref); // Push the callback function onto the stack
+
+        // Push results based on whether an error occurred
+        if (error_message.empty()) {
+            // Success: push content and nil for error
+            lua_pushlstring(main_L, content.data(), content.size());
+            lua_pushnil(main_L); // No error
+        } else {
+            // Error: push nil for content and error message
+            lua_pushnil(main_L);
+            lua_pushstring(main_L, error_message.c_str());
+        }
+
+        // Call the Lua callback function with 2 return values (content/nil, nil/error_message)
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) { // 2 arguments, 0 results, no error handler func
+            std::cerr << "Async read callback error: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1); // Pop the error message from the stack
+        }
+
+        luaL_unref(main_L, LUA_REGISTRYINDEX, cb_ref); // Release the callback reference
+    }).detach();
+
+    return 0; // Lua function returns 0 results
+}
+
+int uw_async_write_file(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    size_t len;
+    const char *data = luaL_checklstring(L, 2, &len);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    lua_pushvalue(L, 3); // Push the callback function
+    int cb_ref = luaL_ref(L, LUA_REGISTRYINDEX); // Store a reference to the callback
+
+    // Create copies of data needed in the thread to avoid dangling pointers
+    std::string path_copy = path;
+    std::string data_copy(data, len); // Create a copy of the data
+
+    std::thread([path_copy, data_copy, cb_ref]() {
+        bool success = false;
+        std::string error_message; // To store any error during file operation
+
+        // Open file for writing in binary mode, truncating existing content
+        std::ofstream file(path_copy, std::ios::binary | std::ios::trunc);
+
+        if (file.is_open()) {
+            try {
+                file.write(data_copy.data(), data_copy.size());
+                if (file.good()) {
+                    success = true; // Check if the write operation was successful
+                } else {
+                    error_message = "Error writing data to file: " + path_copy;
+                }
+            } catch (const std::exception& e) {
+                error_message = "Exception during file write: " + std::string(e.what());
+            }
+            file.close(); // Explicitly close the file
+        } else {
+            error_message = "Failed to open file for writing: " + path_copy;
+        }
+
+        // Acquire lock before interacting with the Lua state
+        std::lock_guard<std::mutex> lock(lua_mutex);
+
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, cb_ref); // Push the callback function onto the stack
+
+        // Push results based on whether an error occurred
+        if (error_message.empty()) {
+            // Success: push true and nil for error
+            lua_pushboolean(main_L, success);
+            lua_pushnil(main_L); // No error
+        } else {
+            // Error: push false for success status and error message
+            lua_pushboolean(main_L, false); // Indicate failure
+            lua_pushstring(main_L, error_message.c_str());
+        }
+
+        // Call the Lua callback function with 2 return values (success_bool, nil/error_message)
+        if (lua_pcall(main_L, 2, 0, 0) != LUA_OK) { // 2 arguments, 0 results, no error handler func
+            std::cerr << "Async write callback error: " << lua_tostring(main_L, -1) << std::endl;
+            lua_pop(main_L, 1); // Pop the error message from the stack
+        }
+
+        luaL_unref(main_L, LUA_REGISTRYINDEX, cb_ref); // Release the callback reference
+    }).detach();
+
+    return 0; // Lua function returns 0 results
+}
+
+// --- Synchronous File Operations ---
+
+// Reads the content of a file synchronously.
+// Lua Usage: content, err_msg = read_file(path)
+// Returns:
+//   - On success: string content, nil
+//   - On error: nil, string error_message
+int uw_sync_read_file(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1); // Get the file path from Lua
+
+    std::string content;
+    std::string error_message;
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate); // Open in binary mode, seek to end
+
+    if (file.is_open()) {
+        std::streampos file_size = file.tellg(); // Get file size
+        file.seekg(0, std::ios::beg);            // Seek back to beginning
+
+        try {
+            // Read the entire file content into the string
+            content.reserve(file_size); // Pre-allocate memory for efficiency
+            content.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+            if (file.bad()) { // Check for errors during reading after assignment
+                error_message = "Error during file read operation: " + std::string(path);
+            }
+        } catch (const std::bad_alloc& e) {
+            error_message = "Memory allocation failed for file content: " + std::string(e.what());
+        } catch (const std::exception& e) {
+            error_message = "Unexpected error reading file: " + std::string(e.what());
+        }
+
+        file.close(); // Explicitly close the file
+    } else {
+        error_message = "Failed to open file for reading: " + std::string(path);
+    }
+
+    // Push results to Lua
+    if (error_message.empty()) {
+        lua_pushlstring(L, content.data(), content.size()); // Push content
+        lua_pushnil(L);                                     // No error message
+        return 2; // Return 2 values
+    } else {
+        lua_pushnil(L);              // No content
+        lua_pushstring(L, error_message.c_str()); // Push error message
+        return 2; // Return 2 values
+    }
+}
+
+// Writes data to a file synchronously.
+// Lua Usage: success, err_msg = write_file(path, data)
+// Returns:
+//   - On success: true, nil
+//   - On error: false, string error_message
+int uw_sync_write_file(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);    // Get the file path
+    size_t len;
+    const char *data = luaL_checklstring(L, 2, &len); // Get the data and its length
+
+    bool success = false;
+    std::string error_message;
+
+    // Open file for writing in binary mode, truncating existing content
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+
+    if (file.is_open()) {
+        try {
+            file.write(data, len); // Write the data
+
+            if (file.good()) { // Check if the write operation was successful
+                success = true;
+            } else {
+                error_message = "Error writing data to file: " + std::string(path);
+            }
+        } catch (const std::exception& e) {
+            error_message = "Exception during file write: " + std::string(e.what());
+        }
+        file.close(); // Explicitly close the file
+    } else {
+        error_message = "Failed to open file for writing: " + std::string(path);
+    }
+
+    // Push results to Lua
+    lua_pushboolean(L, success); // Push true/false for success
+    if (error_message.empty()) {
+        lua_pushnil(L); // No error message
+    } else {
+        lua_pushstring(L, error_message.c_str()); // Push error message
+    }
+    return 2; // Return 2 values
+}
+
+
 int uw_listen(lua_State *L) {
     if (!app) {
         std::cerr << "Error: uWS::App not initialized." << std::endl;
@@ -1331,6 +1594,10 @@ extern "C" int luaopen_uwebsockets(lua_State *L) {
         {"setInterval", uw_setInterval},
         {"clearTimer", uw_clearTimer},
         {"cleanup_app", uw_cleanup_app}, // Add this new function
+        {"async_read_file", uw_async_read_file},
+        {"async_write_file", uw_async_write_file},
+        {"sync_read_file", uw_sync_read_file},
+        {"sync_write_file", uw_sync_write_file},
 
         // {"add_timer", uw_add_timer}, // This function was not defined in the provided shim.cpp
         {nullptr, nullptr}

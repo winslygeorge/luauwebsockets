@@ -1,0 +1,3 @@
+/home/winslow/projects/luauwebsockets/CMakeFiles/uwebsockets.dir
+/home/winslow/projects/luauwebsockets/CMakeFiles/edit_cache.dir
+/home/winslow/projects/luauwebsockets/CMakeFiles/rebuild_cache.dir
