@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -g -g -shared -Wl,-soname,uwebsockets.so -o src/uwebsockets.so CMakeFiles/uwebsockets.dir/src/shim.cpp.o  uWebSockets/uSockets/uSockets.a -lssl -lcrypto -lz -lpthread 
