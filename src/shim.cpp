@@ -180,11 +180,62 @@ void call_lua_callback(int lua_ref, int num_args, std::function<void(lua_State*)
 
 // --- Timer functions ---
 
+// void libus_timer_callback(struct us_timer_t *timer) {
+//     LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
+//     if (!data || data->is_cleared) {
+//         if (data) {
+//             // us_timer_close(timer);
+//             active_timers.erase(data->timer_id);
+//         }
+//         return;
+//     }
+
+//     std::lock_guard<std::mutex> lock(lua_mutex);
+
+//     lua_State* L = data->thread;
+
+//     lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push Lua function
+
+//     if (!lua_isfunction(L, -1)) {
+//         std::cerr << "[TimerCallback] Timer ID " << data->timer_id << ": not a function\n";
+//         lua_pop(L, 1);
+//         return;
+//     }
+
+//     // Push context table(s) from arg_refs
+//     int arg_count = 0;
+//     for (int ref : data->arg_refs) {
+//         lua_rawgeti(L, LUA_REGISTRYINDEX, ref); // push context table or additional args
+//         ++arg_count;
+//     }
+
+//     int status = lua_resume(L, arg_count);
+
+//     if (status != LUA_OK && status != LUA_YIELD) {
+//         const char* err = lua_tostring(L, -1);
+//         std::cerr << "[TimerCallback] Timer ID " << data->timer_id << " error: "
+//                   << (err ? err : "unknown") << "\n";
+//         lua_pop(L, 1); // remove error message
+//     }
+
+//     if (!data->is_interval) {
+//         // One-time timeout: clean everything
+//         data->is_cleared = true;
+
+//         luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
+//         for (int ref : data->arg_refs) {
+//             luaL_unref(data->owner, LUA_REGISTRYINDEX, ref);
+//         }
+
+//         // us_timer_close(timer);
+//         active_timers.erase(data->timer_id);
+//     }
+// }
+
 void libus_timer_callback(struct us_timer_t *timer) {
     LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
     if (!data || data->is_cleared) {
         if (data) {
-            // us_timer_close(timer);
             active_timers.erase(data->timer_id);
         }
         return;
@@ -193,33 +244,44 @@ void libus_timer_callback(struct us_timer_t *timer) {
     std::lock_guard<std::mutex> lock(lua_mutex);
 
     lua_State* L = data->thread;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push Lua function
-
-    if (!lua_isfunction(L, -1)) {
-        std::cerr << "[TimerCallback] Timer ID " << data->timer_id << ": not a function\n";
-        lua_pop(L, 1);
+    if (!L) {
+        std::cerr << "[TimerCallback] Lua thread is NULL for timer ID: " << data->timer_id << "\n";
         return;
     }
 
-    // Push context table(s) from arg_refs
+    if(!data->lua_ref){
+
+          std::cerr << "[TimerCallback] Lua thread is NULL for timer ID: \n";
+        return;
+
+    }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push the function
+
+    if (!lua_isfunction(L, -1)) {
+        std::cerr << "[TimerCallback] Ref is not a function for timer ID: " << data->timer_id << "\n";
+        lua_pop(L, 1); // Clean stack
+        return;
+    }
+
+    // Push argument tables stored in arg_refs
     int arg_count = 0;
     for (int ref : data->arg_refs) {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, ref); // push context table or additional args
-        ++arg_count;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        arg_count++;
     }
 
     int status = lua_resume(L, arg_count);
 
     if (status != LUA_OK && status != LUA_YIELD) {
         const char* err = lua_tostring(L, -1);
-        std::cerr << "[TimerCallback] Timer ID " << data->timer_id << " error: "
-                  << (err ? err : "unknown") << "\n";
-        lua_pop(L, 1); // remove error message
+        std::cerr << "[TimerCallback] lua_resume failed (timer ID " << data->timer_id << "): "
+                  << (err ? err : "unknown error") << "\n";
+        lua_pop(L, 1);
     }
 
     if (!data->is_interval) {
-        // One-time timeout: clean everything
+        // Clean up after one-shot timer
         data->is_cleared = true;
 
         luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
@@ -227,10 +289,11 @@ void libus_timer_callback(struct us_timer_t *timer) {
             luaL_unref(data->owner, LUA_REGISTRYINDEX, ref);
         }
 
-        // us_timer_close(timer);
+        us_timer_close(timer);
         active_timers.erase(data->timer_id);
     }
 }
+
 
 
 
@@ -993,8 +1056,8 @@ int uw_serve_static(lua_State *L) {
     const char *route_prefix = luaL_checkstring(L, 1);
     const char *dir_path = luaL_checkstring(L, 2);
 
-    std::cout << "[uw_serve_static] Registering static route: " << route_prefix
-              << " serving from directory: " << dir_path << std::endl;
+    // std::cout << "[uw_serve_static] Registering static route: " << route_prefix
+    //           << " serving from directory: " << dir_path << std::endl;
 
     if (!fs::is_directory(dir_path)) {
         std::cerr << "ERROR: Static file directory '" << dir_path << "' does not exist or is not a directory." << std::endl;
@@ -1006,13 +1069,13 @@ int uw_serve_static(lua_State *L) {
 
     app->get(route_pattern.c_str(), [dir_path_str = std::string(dir_path), route_prefix_str = std::string(route_prefix)](auto *res, auto *req) {
         std::string_view url = req->getUrl();
-        std::cout << "[Request] Incoming URL: " << url << std::endl;
+        // std::cout << "[Request] Incoming URL: " << url << std::endl;
 
         std::string file_path_suffix = std::string(url.substr(route_prefix_str.length()));
         if (!file_path_suffix.empty() && file_path_suffix[0] == '/') {
             file_path_suffix.erase(0, 1);
         }
-        std::cout << "[Request] Extracted file path suffix: " << file_path_suffix << std::endl;
+        // std::cout << "[Request] Extracted file path suffix: " << file_path_suffix << std::endl;
 
         if (file_path_suffix.find("..") != std::string::npos) {
             std::cerr << "WARNING: Directory traversal attempt detected for: " << file_path_suffix << std::endl;
@@ -1021,10 +1084,10 @@ int uw_serve_static(lua_State *L) {
         }
 
         fs::path full_path = fs::path(dir_path_str) / file_path_suffix;
-        std::cout << "[File Path] Constructed full path: " << full_path.string() << std::endl;
+        // std::cout << "[File Path] Constructed full path: " << full_path.string() << std::endl;
 
         if (fs::is_directory(full_path)) {
-            std::cout << "[File Path] Path is a directory, appending index.html." << std::endl;
+            // std::cout << "[File Path] Path is a directory, appending index.html." << std::endl;
             full_path /= "index.html";
         }
 
@@ -1036,12 +1099,12 @@ int uw_serve_static(lua_State *L) {
                 size_t file_size = file_stream_ptr->tellg();
                 file_stream_ptr->seekg(0, std::ios::beg);
 
-                std::cout << "[File Open] File '" << full_path.string() << "' opened successfully. Size: " << file_size << " bytes." << std::endl;
+                // std::cout << "[File Open] File '" << full_path.string() << "' opened successfully. Size: " << file_size << " bytes." << std::endl;
 
                 std::string mime_type = get_mime_type(full_path.string());
                 res->writeHeader("Content-Type", mime_type);
                 res->writeHeader("Content-Length", std::to_string(file_size));
-                std::cout << "[Headers] Set Content-Type: " << mime_type << ", Content-Length: " << file_size << std::endl;
+                // std::cout << "[Headers] Set Content-Type: " << mime_type << ", Content-Length: " << file_size << std::endl;
 
                 // Determine a reasonable max chunk size for a single write to avoid onWritable for small files
                 // UWS_MAX_SENDFILE_SIZE is not directly exposed to userland code like this.
@@ -1057,7 +1120,7 @@ int uw_serve_static(lua_State *L) {
                         res->writeStatus("500 Internal Server Error")->end("File Read Error");
                         return;
                     }
-                    std::cout << "[Small File] Sending entire file (" << file_size << " bytes) in one go." << std::endl;
+                    // std::cout << "[Small File] Sending entire file (" << file_size << " bytes) in one go." << std::endl;
                     res->end(std::string_view(buffer.data(), file_size));
                     // No need for onWritable or explicit res->write, res->end(data) sends it all.
                 } else {
