@@ -1,8 +1,8 @@
--- uwebsockets-0.1.0-8.rockspec
+-- uwebsockets-0.1.0-9.rockspec
 -- The package name is "uwebsockets" to directly match the luaopen_uwebsockets function.
 
 package = "uwebsockets"
-version = "0.1.0-8" -- Format: <library_version>-<rockspec_revision>
+version = "0.1.0-9" -- Format: <library_version>-<rockspec_revision>
 
 -- The 'source' section tells LuaRocks where to download your project's source code.
 source = {

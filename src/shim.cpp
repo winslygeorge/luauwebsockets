@@ -16,12 +16,27 @@
 #include <fstream>    // For file operations
 #include <filesystem> // For path manipulation (C++17)
 
+#include <chrono>
+#include <sys/stat.h> // Added for fstat
+
+#include <system_error>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#elif _WIN32
+#include <windows.h>
+#endif
+
+namespace fs = std::filesystem;
+
 
 namespace fs = std::filesystem; // Alias for convenience
 
 // For getnameinfo, NI_MAXHOST, NI_NUMERICHOST
 
 static std::shared_ptr<uWS::App> app;
+static us_listen_socket_t *listen_socket = nullptr;
 static lua_State *main_L = nullptr;
 static std::mutex lua_mutex;
 static std::unordered_map<int, int> lua_callbacks; // For general route callbacks
@@ -53,20 +68,24 @@ struct Middleware {
 
 static std::vector<Middleware> middlewares;
 
+int timer_id = 0;
+us_loop_t *main_loop = nullptr;
+
 struct LuaTimerData {
     lua_State* owner;
     lua_State* thread;
     int lua_ref;
+    int thread_ref;
     int timer_id;
     bool is_interval;
     bool is_cleared;
-    std::vector<int> arg_refs; // <-- Add this line to store arguments
+    std::vector<int> arg_refs;
 };
 
 
 
-std::unordered_map<int, us_timer_t*> active_timers;
-int timer_id_counter = 0;
+// std::unordered_map<int, us_timer_t*> active_timers;
+// int timer_id_counter = 0;
 
 // Helper to get app pointer for uWS::Loop
 uWS::Loop *get_uWS_Loop() {
@@ -90,14 +109,9 @@ void push_map_to_lua(lua_State* L, const std::unordered_map<std::string, std::st
 }
 
 
-int uw_create_app(lua_State *L) {
-    if (!app) {
-        app = std::make_shared<uWS::App>();
-        main_L = L;
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
+
+
+
 
 int create_req_userdata(lua_State *L, uWS::HttpRequest* req) {
     void *ud = lua_newuserdata(L, sizeof(uWS::HttpRequest*));
@@ -176,395 +190,273 @@ void call_lua_callback(int lua_ref, int num_args, std::function<void(lua_State*)
 }
 
 
-// --- Timer functions ---
-
-// --- Timer functions ---
-
-// void libus_timer_callback(struct us_timer_t *timer) {
-//     LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
-//     if (!data || data->is_cleared) {
-//         if (data) {
-//             // us_timer_close(timer);
-//             active_timers.erase(data->timer_id);
-//         }
-//         return;
-//     }
-
-//     std::lock_guard<std::mutex> lock(lua_mutex);
-
-//     lua_State* L = data->thread;
-
-//     lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push Lua function
-
-//     if (!lua_isfunction(L, -1)) {
-//         std::cerr << "[TimerCallback] Timer ID " << data->timer_id << ": not a function\n";
-//         lua_pop(L, 1);
-//         return;
-//     }
-
-//     // Push context table(s) from arg_refs
-//     int arg_count = 0;
-//     for (int ref : data->arg_refs) {
-//         lua_rawgeti(L, LUA_REGISTRYINDEX, ref); // push context table or additional args
-//         ++arg_count;
-//     }
-
-//     int status = lua_resume(L, arg_count);
-
-//     if (status != LUA_OK && status != LUA_YIELD) {
-//         const char* err = lua_tostring(L, -1);
-//         std::cerr << "[TimerCallback] Timer ID " << data->timer_id << " error: "
-//                   << (err ? err : "unknown") << "\n";
-//         lua_pop(L, 1); // remove error message
-//     }
-
-//     if (!data->is_interval) {
-//         // One-time timeout: clean everything
-//         data->is_cleared = true;
-
-//         luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
-//         for (int ref : data->arg_refs) {
-//             luaL_unref(data->owner, LUA_REGISTRYINDEX, ref);
-//         }
-
-//         // us_timer_close(timer);
-//         active_timers.erase(data->timer_id);
-//     }
-// }
-
-void libus_timer_callback(struct us_timer_t *timer) {
-    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
-    if (!data || data->is_cleared) {
-        if (data) {
-            active_timers.erase(data->timer_id);
-        }
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(lua_mutex);
-
-    lua_State* L = data->thread;
-    if (!L) {
-        std::cerr << "[TimerCallback] Lua thread is NULL for timer ID: " << data->timer_id << "\n";
-        return;
-    }
-
-    if(!data->lua_ref){
-
-          std::cerr << "[TimerCallback] Lua thread is NULL for timer ID: \n";
-        return;
-
-    }
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, data->lua_ref); // Push the function
-
-    if (!lua_isfunction(L, -1)) {
-        std::cerr << "[TimerCallback] Ref is not a function for timer ID: " << data->timer_id << "\n";
-        lua_pop(L, 1); // Clean stack
-        return;
-    }
-
-    // Push argument tables stored in arg_refs
-    int arg_count = 0;
-    for (int ref : data->arg_refs) {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-        arg_count++;
-    }
-
-    int status = lua_resume(L, arg_count);
-
-    if (status != LUA_OK && status != LUA_YIELD) {
-        const char* err = lua_tostring(L, -1);
-        std::cerr << "[TimerCallback] lua_resume failed (timer ID " << data->timer_id << "): "
-                  << (err ? err : "unknown error") << "\n";
-        lua_pop(L, 1);
-    }
-
-    if (!data->is_interval) {
-        // Clean up after one-shot timer
-        data->is_cleared = true;
-
-        luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
-        for (int ref : data->arg_refs) {
-            luaL_unref(data->owner, LUA_REGISTRYINDEX, ref);
-        }
-
-        us_timer_close(timer);
-        active_timers.erase(data->timer_id);
-    }
-}
-
-
-
-
-// void libus_timer_callback(struct us_timer_t *timer) {
-//     LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
-//     if (!data || data->is_cleared) {
-//         if (data) {
-//             us_timer_close(timer);
-//             active_timers.erase(data->timer_id);
-//         }
-//         return;
-//     }
-
-//     std::lock_guard<std::mutex> lock(lua_mutex);
-
-//     if (data->is_interval) {
-//         // INTERVAL: create new coroutine, run stored function
-//         lua_State* thread = lua_newthread(data->owner);
-//         lua_rawgeti(thread, LUA_REGISTRYINDEX, data->lua_ref);
-//         if (!lua_isfunction(thread, -1)) {
-//             std::cerr << "[TimerCallback] Interval ref is not function\n";
-//             lua_pop(thread, 1);
-//             return;
-//         }
-
-//         int status = lua_resume(thread, 0);
-//         if (status != LUA_OK && status != LUA_YIELD) {
-//             std::cerr << "[TimerCallback] Interval error: " << (lua_isstring(thread, -1) ? lua_tostring(thread, -1) : "unknown") << "\n";
-//             lua_pop(thread, 1);
-//         }
-
-//     } else {
-//         // TIMEOUT: resume coroutine once
-//         lua_rawgeti(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
-
-//         if (!lua_isfunction(data->owner, -1)) {
-//             std::cerr << "[TimerCallback] Timeout ref is not function\n";
-//             lua_pop(data->owner, 1);
-//             return;
-//         }
-//         int status = lua_resume(data->owner, 0);
-//         if (status != LUA_OK && status != LUA_YIELD) {
-//             std::cerr << "[TimerCallback] Timeout error: " << (lua_isstring(data->owner, -1) ? lua_tostring(data->owner, -1) : "unknown") << "\n";
-//             lua_pop(data->owner, 1);
-//         }
-
-//         data->is_cleared = true;
-//         luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
-//         active_timers.erase(data->timer_id);
-//     }
-// }
-
-
-
-
-
-
-// --- Timer functions ---
-
-
-
-// --- Timer functions ---
-int uw_setTimeout(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    long long delay_ms = luaL_checkinteger(L, 2);
-    int nargs = lua_gettop(L) - 2;
-
-    std::lock_guard<std::mutex> lock(lua_mutex);
-
-    int timer_id = timer_id_counter++;
-
-    lua_State* thread = lua_newthread(L);
-    lua_pushvalue(L, 1);           // Push the function
-    lua_xmove(L, thread, 1);       // Move to new thread
-    int fn_ref = luaL_ref(thread, LUA_REGISTRYINDEX);
-
-    us_loop_t* loop = (us_loop_t *)uWS::Loop::get();
-    us_timer_t* timer = us_create_timer(loop, 1, sizeof(LuaTimerData));
-    if (!timer) {
-        luaL_unref(thread, LUA_REGISTRYINDEX, fn_ref);
-        lua_pushnil(L);
-        return 1;
-    }
-
-    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
-    memset(data, 0, sizeof(LuaTimerData));
-    data->thread = thread;
-    data->owner = thread;
-    data->lua_ref = fn_ref;
-    data->timer_id = timer_id;
-    data->is_interval = false;
-    data->is_cleared = false;
-
-    // Create context table
-    lua_newtable(L);                                  // ctx
-    lua_pushstring(L, "id"); lua_pushinteger(L, timer_id); lua_settable(L, -3);
-    lua_pushstring(L, "type"); lua_pushstring(L, "timeout"); lua_settable(L, -3);
-    lua_pushstring(L, "delay_ms"); lua_pushinteger(L, delay_ms); lua_settable(L, -3);
-
-    // Capture additional arguments
-    if (nargs > 0) {
-        lua_pushstring(L, "args");
-        lua_newtable(L);  // args table
-        for (int i = 0; i < nargs; i++) {
-            lua_pushinteger(L, i + 1);
-            lua_pushvalue(L, 3 + i);
-            lua_settable(L, -3);
-        }
-        lua_settable(L, -3); // ctx.args = { ... }
-    }
-
-    data->arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));  // ref to ctx table
-
-    us_timer_set(timer, libus_timer_callback, delay_ms, 0);
-    active_timers[timer_id] = timer;
-
-    lua_pushinteger(L, timer_id);
-    return 1;
-}
-
-
-int uw_setInterval(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    long long interval_ms = luaL_checkinteger(L, 2);
-    int nargs = lua_gettop(L) - 2;
-
-    std::lock_guard<std::mutex> lock(lua_mutex);
-
-    int timer_id = timer_id_counter++;
-
-    lua_State* thread = lua_newthread(L); // Isolated coroutine
-    lua_pushvalue(L, 1);                  // Push function
-    lua_xmove(L, thread, 1);              // Move to new thread
-    int fn_ref = luaL_ref(thread, LUA_REGISTRYINDEX); // Ref in new thread
-
-    us_loop_t* loop = (us_loop_t *)uWS::Loop::get();
-    us_timer_t* timer = us_create_timer(loop, 1, sizeof(LuaTimerData));
-    if (!timer) {
-        luaL_unref(thread, LUA_REGISTRYINDEX, fn_ref);
-        lua_pushnil(L);
-        return 1;
-    }
-
-    LuaTimerData* data = (LuaTimerData*)us_timer_ext(timer);
-    memset(data, 0, sizeof(LuaTimerData));
-    data->owner = thread;
-    data->thread = thread;
-    data->lua_ref = fn_ref;
-    data->timer_id = timer_id;
-    data->is_interval = true;
-    data->is_cleared = false;
-
-    // Build ctx table
-    lua_newtable(L);                                  // ctx
-    lua_pushstring(L, "id"); lua_pushinteger(L, timer_id); lua_settable(L, -3);
-    lua_pushstring(L, "type"); lua_pushstring(L, "interval"); lua_settable(L, -3);
-    lua_pushstring(L, "interval_ms"); lua_pushinteger(L, interval_ms); lua_settable(L, -3);
-
-    if (nargs > 0) {
-        lua_pushstring(L, "args");
-        lua_newtable(L);
-        for (int i = 0; i < nargs; i++) {
-            lua_pushinteger(L, i + 1);
-            lua_pushvalue(L, 3 + i);
-            lua_settable(L, -3);
-        }
-        lua_settable(L, -3); // ctx.args = { ... }
-    }
-
-    data->arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX)); // ref ctx table in main state (L)
-
-    us_timer_set(timer, libus_timer_callback, interval_ms, interval_ms);
-    active_timers[timer_id] = timer;
-
-    std::cout << "[setInterval] Created isolated interval ID: " << timer_id << "\n";
-
-    lua_pushinteger(L, timer_id);
-    return 1;
-}
-
-
-
-
-
-int uw_clearTimer(lua_State *L) {
-    int timer_id = luaL_checkinteger(L, 1);
-
-    std::lock_guard<std::mutex> lock(lua_mutex);
-    auto it = active_timers.find(timer_id);
-    if (it != active_timers.end()) {
-        us_timer_t* timer = it->second;
-        LuaTimerData *data = (LuaTimerData *)us_timer_ext(timer);
-        if (data && !data->is_cleared) {
-            data->is_cleared = true;
-            luaL_unref(data->owner, LUA_REGISTRYINDEX, data->lua_ref);
-            us_timer_set(timer, nullptr, 0, 0);  // Disarm before closing
-            us_timer_close(timer);
-        }
-        active_timers.erase(it);
-        std::cout << "[clearTimer] Cleared timer ID: " << timer_id << "\n";
-        lua_pushboolean(L, 1);
-    } else {
-        std::cerr << "[clearTimer] Timer ID " << timer_id << " not found.\n";
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-
-
 // User data structure for WebSocket
 struct WebSocketUserData {
     std::string id;
+    bool is_closed = false;
+    uWS::WebSocket<false, true, WebSocketUserData>* socket = nullptr;
+     // Store additional user data if needed
+    std::unordered_map<std::string, std::string> metadata;
 };
 
+// Fully corrected create_zombie_websocket
+static int create_zombie_websocket(lua_State *L, const std::string& id) {
+    using WebSocketPtr = uWS::WebSocket<false, true, WebSocketUserData>*;
+    
+    WebSocketPtr* ws_ud = static_cast<WebSocketPtr*>(
+        lua_newuserdata(L, sizeof(WebSocketPtr)));
+    *ws_ud = nullptr;
+    
+    lua_newtable(L);
+    lua_pushstring(L, id.c_str());
+    lua_setfield(L, -2, "id");
+    lua_pushboolean(L, true);
+    lua_setfield(L, -2, "closed");
+    
+    luaL_getmetatable(L, "websocket");
+    lua_setmetatable(L, -2);
+    
+    return 1;
+}
+
+
+// static int websocket_send(lua_State *L) {
+//     void *ud = luaL_checkudata(L, 1, "websocket");
+//     if (!ud) {
+//         lua_pushboolean(L, 0);
+//         lua_pushstring(L, "Invalid userdata");
+//         return 2;
+//     }
+
+//     auto ws_ptr = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+//     if (!ws_ptr) {
+//         lua_pushboolean(L, 0);
+//         lua_pushstring(L, "Socket pointer is null");
+//         return 2;
+//     }
+
+//     auto *userdata = ws_ptr->getUserData();
+//     if (!userdata || userdata->is_closed || userdata->socket != ws_ptr) {
+//         lua_pushboolean(L, 0);
+//         lua_pushstring(L, "Socket has been closed or is invalid");
+//         return 2;
+//     }
+
+//     const char *message = luaL_checkstring(L, 2);
+//     size_t len = lua_objlen(L, 2);
+//     uWS::OpCode opcode = uWS::OpCode::TEXT;
+
+//     if (lua_gettop(L) > 2 && lua_isstring(L, 3)) {
+//         const char *type = luaL_checkstring(L, 3);
+//         if (strcmp(type, "binary") == 0) {
+//             opcode = uWS::OpCode::BINARY;
+//         }
+//     }
+
+//     userdata->socket->send(std::string_view(message, len), opcode);
+//     lua_pushboolean(L, 1);
+//     return 1;
+// }
+
+// Update websocket_send to handle zombie sockets
+// Fully corrected websocket_send
 static int websocket_send(lua_State *L) {
-    void *ud = luaL_checkudata(L, 1, "websocket");
-    if (!ud) {
-        luaL_error(L, "Invalid WebSocket object");
-        return 0;
+    using WebSocketPtr = uWS::WebSocket<false, true, WebSocketUserData>*;
+    
+    WebSocketPtr* ws_ptr = static_cast<WebSocketPtr*>(luaL_checkudata(L, 1, "websocket"));
+    if (!ws_ptr) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Invalid userdata");
+        return 2;
     }
-    uWS::WebSocket<false, true, WebSocketUserData>* ws = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+
+    if (!*ws_ptr) {
+        if (lua_getmetatable(L, 1)) {
+            lua_getfield(L, -1, "id");
+            if (lua_isstring(L, -1)) {
+                const char* id = lua_tostring(L, -1);
+                lua_pushboolean(L, 0);
+                lua_pushfstring(L, "Socket %s is closed", id);
+                lua_remove(L, -3);
+                return 2;
+            }
+            lua_pop(L, 2);
+        }
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Socket is closed");
+        return 2;
+    }
+
+    auto *userdata = (*ws_ptr)->getUserData();
+    if (!userdata || userdata->is_closed || userdata->socket != *ws_ptr) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Socket has been closed or is invalid");
+        return 2;
+    }
+
     const char *message = luaL_checkstring(L, 2);
-    size_t len = lua_objlen(L, 2); // Correct way to get length for string
-    uWS::OpCode opCodeToSend = uWS::OpCode::TEXT; // Default to text
+    size_t len = lua_objlen(L, 2);
+    uWS::OpCode opcode = uWS::OpCode::TEXT;
 
     if (lua_gettop(L) > 2 && lua_isstring(L, 3)) {
         const char *type = luaL_checkstring(L, 3);
         if (strcmp(type, "binary") == 0) {
-            opCodeToSend = uWS::OpCode::BINARY;
+            opcode = uWS::OpCode::BINARY;
         }
     }
 
-    if (ws) {
-        ws->send(std::string_view(message, len), opCodeToSend);
-        lua_pushboolean(L, 1);
-        return 1;
-    } else {
-        luaL_error(L, "Invalid WebSocket object");
-        return 0;
-    }
+    userdata->socket->send(std::string_view(message, len), opcode);
+    lua_pushboolean(L, 1);
+    return 1;
 }
+
 
 static int websocket_close(lua_State *L) {
     void *ud = luaL_checkudata(L, 1, "websocket");
     if (!ud) {
-        luaL_error(L, "Invalid WebSocket object");
-        return 0;
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Invalid userdata");
+        return 2;
     }
-    uWS::WebSocket<false, true, DummyUserData>* ws = *(uWS::WebSocket<false, true, DummyUserData>**)ud;
-    if (ws) {
-        ws->close(); // Call close with no arguments
-        lua_pushboolean(L, 1);
-        return 1;
-    } else {
-        luaL_error(L, "Invalid WebSocket object");
-        return 0;
+
+    auto ws = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+    if (!ws) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Socket pointer is null");
+        return 2;
     }
+
+    auto *userdata = ws->getUserData();
+    if (!userdata || userdata->is_closed || userdata->socket != ws) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "Socket already closed or invalid");
+        return 2;
+    }
+
+    userdata->is_closed = true;
+    userdata->socket = nullptr;
+    ws->close();
+
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
+// Function to create a WebSocket userdata
+
+// Update websocket_get_id to work with zombie sockets
+static int websocket_get_id(lua_State *L) {
+    uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = 
+        static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(luaL_checkudata(L, 1, "websocket"));
+    
+    // Handle zombie sockets
+    if (!*ws_ud) {
+        if (lua_getmetatable(L, 1)) {
+            lua_getfield(L, -1, "id");
+            if (lua_isstring(L, -1)) {
+                // Return the ID from the environment table
+                return 1;
+            }
+            lua_pop(L, 2); // pop string and metatable
+        }
+        lua_pushnil(L);
+        return 1;
+    }
+
+    if (!*ws_ud || !(*ws_ud)->getUserData()) {
+        luaL_error(L, "invalid websocket userdata");
+        return 0;
+    }
+
+    lua_pushstring(L, (*ws_ud)->getUserData()->id.c_str());
+    return 1;
+}
+
+// Add metadata access methods to websocket metatable
 static void create_websocket_metatable(lua_State *L) {
     luaL_newmetatable(L, "websocket");
     lua_pushstring(L, "__index");
-    lua_newtable(L); // Metatable for methods
+    lua_newtable(L);
+    
+    // Existing methods
     lua_pushcfunction(L, websocket_send);
     lua_setfield(L, -2, "send");
     lua_pushcfunction(L, websocket_close);
     lua_setfield(L, -2, "close");
-    lua_settable(L, -3); // Set __index to the methods table
-    lua_pop(L, 1); // Pop the metatable
+    lua_pushcfunction(L, websocket_get_id);
+    lua_setfield(L, -2, "get_id");
+    
+    // New metadata methods
+    lua_pushcfunction(L, [](lua_State *L) -> int {
+        void *ud = luaL_checkudata(L, 1, "websocket");
+        auto ws_ptr = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+        
+        WebSocketUserData* userdata = nullptr;
+        if (ws_ptr) {
+            userdata = ws_ptr->getUserData();
+        } else {
+            // For zombie sockets, we can't access userdata
+            lua_pushnil(L);
+            return 1;
+        }
+
+        if (!userdata) {
+            lua_pushnil(L);
+            return 1;
+        }
+
+        const char *key = luaL_checkstring(L, 2);
+        auto it = userdata->metadata.find(key);
+        if (it != userdata->metadata.end()) {
+            lua_pushstring(L, it->second.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        return 1;
+    });
+    lua_setfield(L, -2, "get_metadata");
+    
+    lua_pushcfunction(L, [](lua_State *L) -> int {
+        void *ud = luaL_checkudata(L, 1, "websocket");
+        auto ws_ptr = *(uWS::WebSocket<false, true, WebSocketUserData>**)ud;
+        
+        if (!ws_ptr) {
+            lua_pushboolean(L, 0);
+            lua_pushstring(L, "Cannot set metadata on closed socket");
+            return 2;
+        }
+
+        WebSocketUserData* userdata = ws_ptr->getUserData();
+        if (!userdata) {
+            lua_pushboolean(L, 0);
+            lua_pushstring(L, "Invalid userdata");
+            return 2;
+        }
+
+        const char *key = luaL_checkstring(L, 2);
+        const char *value = luaL_checkstring(L, 3);
+        userdata->metadata[key] = value;
+        
+        lua_pushboolean(L, 1);
+        return 1;
+    });
+    lua_setfield(L, -2, "set_metadata");
+    
+    lua_settable(L, -3);
+    lua_pop(L, 1);
 }
+
+
+// static void create_websocket_metatable(lua_State *L) {
+//     luaL_newmetatable(L, "websocket");
+//     lua_pushstring(L, "__index");
+//     lua_newtable(L); // Metatable for methods
+//     lua_pushcfunction(L, websocket_send);
+//     lua_setfield(L, -2, "send");
+//     lua_pushcfunction(L, websocket_close);
+//     lua_setfield(L, -2, "close");
+//     lua_settable(L, -3); // Set __index to the methods table
+//     lua_pop(L, 1); // Pop the metatable
+// }
 
 static void create_metatables(lua_State *L) {
     create_websocket_metatable(L);
@@ -938,20 +830,24 @@ std::string generate_unique_id() {
     return ss.str();
 }
 
-// Lua function to get the WebSocket ID
-static int websocket_get_id(lua_State *L) {
-    uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(luaL_checkudata(L, 1, "websocket"));
-    if (!ws_ud || !*ws_ud) {
-        luaL_error(L, "invalid websocket userdata");
-        return 0;
-    }
 
-    lua_pushstring(L, (*ws_ud)->getUserData()->id.c_str());
-    return 1;
-}
+
+
+// Lua function to get the WebSocket ID
+// static int websocket_get_id(lua_State *L) {
+//     uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(luaL_checkudata(L, 1, "websocket"));
+//     if (!ws_ud || !*ws_ud) {
+//         luaL_error(L, "invalid websocket userdata");
+//         return 0;
+//     }
+
+//     lua_pushstring(L, (*ws_ud)->getUserData()->id.c_str());
+//     return 1;
+// }
 
 int uw_ws(lua_State *L) {
-    const char *route = luaL_checkstring(L, 1);
+    const char *route_c_str = luaL_checkstring(L, 1);
+    std::string route = route_c_str; // Explicitly convert to std::string
     luaL_checktype(L, 2, LUA_TFUNCTION);
     lua_pushvalue(L, 2);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -963,14 +859,18 @@ int uw_ws(lua_State *L) {
             std::lock_guard<std::mutex> lock(lua_mutex);
             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
 
-            // Push the WebSocket userdata and set its metatable
-            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
+            // Set WebSocket pointer in userdata
+            WebSocketUserData* data = ws->getUserData();
+            data->id = generate_unique_id();
+            data->socket = ws;
+            data->is_closed = false;
+
+            // Create Lua userdata and store ws pointer
+            auto **ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(
+                lua_newuserdata(main_L, sizeof(*ws_ud)));
             *ws_ud = ws;
             luaL_getmetatable(main_L, "websocket");
             lua_setmetatable(main_L, -2);
-
-            // Generate and store the unique ID in the user data
-            ws->getUserData()->id = generate_unique_id();
 
             lua_pushstring(main_L, "open");
 
@@ -981,12 +881,12 @@ int uw_ws(lua_State *L) {
         },
 
         .message = [callback_id](auto *ws, std::string_view message, uWS::OpCode opCode) {
-            std::cout << "uWS opcode enum value: " << static_cast<int>(opCode) << std::endl;
             std::lock_guard<std::mutex> lock(lua_mutex);
             lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
 
-            // Push the WebSocket userdata with metatable
-            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
+            // Push Lua userdata
+            auto **ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(
+                lua_newuserdata(main_L, sizeof(*ws_ud)));
             *ws_ud = ws;
             luaL_getmetatable(main_L, "websocket");
             lua_setmetatable(main_L, -2);
@@ -995,35 +895,67 @@ int uw_ws(lua_State *L) {
             lua_pushlstring(main_L, message.data(), message.size());
             lua_pushinteger(main_L, static_cast<int>(opCode));
 
-
             if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
                 std::cerr << "Lua error (message): " << lua_tostring(main_L, -1) << std::endl;
                 lua_pop(main_L, 1);
             }
         },
 
+        // .close = [callback_id](auto *ws, int code, std::string_view message) {
+        //     std::lock_guard<std::mutex> lock(lua_mutex);
+        //     WebSocketUserData* data = ws->getUserData();
+        //     if (data) {
+        //         data->is_closed = true;
+        //         data->socket = nullptr;
+        //     }
+
+        //     lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+
+        //     auto **ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(
+        //         lua_newuserdata(main_L, sizeof(*ws_ud)));
+        //     *ws_ud = nullptr;   // prevent reuse
+        //     luaL_getmetatable(main_L, "websocket");
+        //     lua_setmetatable(main_L, -2);
+
+        //     lua_pushstring(main_L, "close");
+        //     lua_pushinteger(main_L, code);
+        //     lua_pushlstring(main_L, message.data(), message.size());
+
+        //     if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+        //         std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
+        //         lua_pop(main_L, 1);
+        //     }
+        // }
+        // Modify the close handler in uw_ws
         .close = [callback_id](auto *ws, int code, std::string_view message) {
-            std::lock_guard<std::mutex> lock(lua_mutex);
-            lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+    std::lock_guard<std::mutex> lock(lua_mutex);
+    WebSocketUserData* data = ws ? ws->getUserData() : nullptr;
+    std::string id;
+    
+    if (data) {
+        data->is_closed = true;
+        data->socket = nullptr;
+        id = data->id;
+    }
 
-            // Push the WebSocket userdata with metatable
-            uWS::WebSocket<false, true, WebSocketUserData>** ws_ud = static_cast<uWS::WebSocket<false, true, WebSocketUserData>**>(lua_newuserdata(main_L, sizeof(uWS::WebSocket<false, true, WebSocketUserData>*)));
-            *ws_ud = ws;
-            luaL_getmetatable(main_L, "websocket");
-            lua_setmetatable(main_L, -2);
+    lua_rawgeti(main_L, LUA_REGISTRYINDEX, lua_callbacks[callback_id]);
+    
+    // Create zombie userdata with the ID
+    create_zombie_websocket(main_L, id);
+    
+    lua_pushstring(main_L, "close");
+    lua_pushinteger(main_L, code);
+    lua_pushlstring(main_L, message.data(), message.size());
 
-            lua_pushstring(main_L, "close");
-            lua_pushinteger(main_L, code);
-            lua_pushlstring(main_L, message.data(), message.size());
-
-            if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
-                std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
-                lua_pop(main_L, 1);
-            }
-        }
+    if (lua_pcall(main_L, 4, 0, 0) != LUA_OK) {
+        std::cerr << "Lua error (close): " << lua_tostring(main_L, -1) << std::endl;
+        lua_pop(main_L, 1);
+    }
+}
+        // Removed .autoUpgrade here
     });
 
-    // Register the get_id function in the "websocket" metatable
+    // Register the get_id method in the websocket metatable
     luaL_getmetatable(L, "websocket");
     lua_pushcfunction(L, websocket_get_id);
     lua_setfield(L, -2, "get_id");
@@ -1033,154 +965,296 @@ int uw_ws(lua_State *L) {
     return 1;
 }
 
-// Helper function to get MIME type (assuming it's correct)
+
 std::string get_mime_type(const std::string& filepath) {
+    static const std::unordered_map<std::string, std::string> mime_types = {
+        {".html", "text/html"},
+        {".htm", "text/html"},
+        {".css", "text/css"},
+        {".js", "application/javascript"},
+        {".json", "application/json"},
+        {".jpg", "image/jpeg"},
+        {".jpeg", "image/jpeg"},
+        {".png", "image/png"},
+        {".gif", "image/gif"},
+        {".svg", "image/svg+xml"},
+        {".ico", "image/x-icon"},
+        {".pdf", "application/pdf"},
+        {".txt", "text/plain"},
+        {".mp4", "video/mp4"},
+        {".webm", "video/webm"},
+        {".mp3", "audio/mpeg"},
+        {".woff2", "font/woff2"}
+    };
+
     fs::path p(filepath);
     std::string ext = p.extension().string();
-    if (ext == ".html" || ext == ".htm") return "text/html";
-    if (ext == ".css") return "text/css";
-    if (ext == ".js") return "application/javascript";
-    if (ext == ".json") return "application/json";
-    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
-    if (ext == ".png") return "image/png";
-    if (ext == ".gif") return "image/gif";
-    if (ext == ".svg") return "image/svg+xml";
-    if (ext == ".ico") return "image/x-icon";
-    if (ext == ".pdf") return "application/pdf";
-    if (ext == ".txt") return "text/plain";
-    return "application/octet-stream";
+    auto it = mime_types.find(ext);
+    return it != mime_types.end() ? it->second : "application/octet-stream";
 }
 
-// New function to serve static files
+// Configuration constants
+namespace {
+    const size_t SMALL_FILE_THRESHOLD = 64 * 1024; // 64KB
+    const size_t LARGE_FILE_CHUNK_SIZE = 128 * 1024; // 128KB
+    const size_t MMAP_THRESHOLD = 10 * 1024 * 1024; // 10MB
+    const unsigned int TRANSFER_TIMEOUT_MS = 30000; // 30 seconds
+}
+
+// Memory-mapped file wrapper
+class MappedFile {
+    int fd = -1;
+    void* mapping = MAP_FAILED;
+    size_t size = 0;
+    const char* data = nullptr;
+
+public:
+    MappedFile(const std::string& path) {
+        fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) {
+            throw std::system_error(errno, std::system_category(), "Failed to open file");
+        }
+
+        struct stat st;
+        if (fstat(fd, &st) == -1) {
+            close(fd);
+            throw std::system_error(errno, std::system_category(), "Failed to get file size");
+        }
+        size = st.st_size;
+
+        mapping = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapping == MAP_FAILED) {
+            close(fd);
+            throw std::system_error(errno, std::system_category(), "Failed to map file");
+        }
+        data = static_cast<const char*>(mapping);
+    }
+
+    ~MappedFile() {
+        if (mapping != MAP_FAILED) munmap(mapping, size);
+        if (fd != -1) close(fd);
+    }
+
+    const char* getData() const { return data; }
+    size_t getSize() const { return size; }
+};
+
+// Helper function to clean path and prevent directory traversal
+std::string sanitize_path(const std::string& base, const std::string& path) {
+    fs::path full_path = fs::path(base) / path;
+    full_path = fs::canonical(full_path);
+    
+    // Verify the path is within the base directory
+    fs::path base_path = fs::canonical(base);
+    if (full_path.string().rfind(base_path.string(), 0) != 0) {
+        throw std::runtime_error("Directory traversal attempt detected");
+    }
+    
+    return full_path.string();
+}
+
+// Enhanced static file serving function with proper completion handling
 int uw_serve_static(lua_State *L) {
     const char *route_prefix = luaL_checkstring(L, 1);
     const char *dir_path = luaL_checkstring(L, 2);
 
-    // std::cout << "[uw_serve_static] Registering static route: " << route_prefix
-    //           << " serving from directory: " << dir_path << std::endl;
-
     if (!fs::is_directory(dir_path)) {
-        std::cerr << "ERROR: Static file directory '" << dir_path << "' does not exist or is not a directory." << std::endl;
+        std::cerr << "ERROR: Static file directory '" << dir_path 
+                  << "' does not exist or is not a directory." << std::endl;
         lua_pushboolean(L, 0);
         return 1;
     }
 
     std::string route_pattern = std::string(route_prefix) + "/*";
 
-    app->get(route_pattern.c_str(), [dir_path_str = std::string(dir_path), route_prefix_str = std::string(route_prefix)](auto *res, auto *req) {
-        std::string_view url = req->getUrl();
-        // std::cout << "[Request] Incoming URL: " << url << std::endl;
+    app->get(route_pattern.c_str(), [dir_path_str = std::string(dir_path), 
+                                   route_prefix_str = std::string(route_prefix)](auto *res, auto *req) {
+        try {
+            std::string_view url = req->getUrl();
+            std::string file_path_suffix = std::string(url.substr(route_prefix_str.length()));
+            
+            // Remove leading slash if present
+            if (!file_path_suffix.empty() && file_path_suffix[0] == '/') {
+                file_path_suffix.erase(0, 1);
+            }
 
-        std::string file_path_suffix = std::string(url.substr(route_prefix_str.length()));
-        if (!file_path_suffix.empty() && file_path_suffix[0] == '/') {
-            file_path_suffix.erase(0, 1);
-        }
-        // std::cout << "[Request] Extracted file path suffix: " << file_path_suffix << std::endl;
+            // Handle directory requests by appending index.html
+            fs::path full_path;
+            try {
+                full_path = sanitize_path(dir_path_str, file_path_suffix);
+                if (fs::is_directory(full_path)) {
+                    full_path /= "index.html";
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "SECURITY: " << e.what() << " for path: " << file_path_suffix << std::endl;
+                res->writeStatus("403 Forbidden")->end("Forbidden");
+                return;
+            }
 
-        if (file_path_suffix.find("..") != std::string::npos) {
-            std::cerr << "WARNING: Directory traversal attempt detected for: " << file_path_suffix << std::endl;
-            res->writeStatus("403 Forbidden")->end("Forbidden");
-            return;
-        }
+            // Check if file exists and is regular file
+            if (!fs::exists(full_path) || !fs::is_regular_file(full_path)) {
+                res->writeStatus("404 Not Found")->end("Not Found");
+                return;
+            }
 
-        fs::path full_path = fs::path(dir_path_str) / file_path_suffix;
-        // std::cout << "[File Path] Constructed full path: " << full_path.string() << std::endl;
+            // Get file size
+            size_t file_size = fs::file_size(full_path);
 
-        if (fs::is_directory(full_path)) {
-            // std::cout << "[File Path] Path is a directory, appending index.html." << std::endl;
-            full_path /= "index.html";
-        }
+            // Set headers
+            std::string mime_type = get_mime_type(full_path.string());
+            res->writeHeader("Content-Type", mime_type);
+            res->writeHeader("Content-Length", std::to_string(file_size));
+            
+            // For small files, send everything at once
+            if (file_size <= SMALL_FILE_THRESHOLD) {
+                std::ifstream file(full_path, std::ios::binary);
+                if (!file) {
+                    std::cerr << "ERROR: Failed to open small file: " << full_path.string() << std::endl;
+                    res->writeStatus("500 Internal Server Error")->end("File Read Error");
+                    return;
+                }
 
-        if (fs::exists(full_path) && fs::is_regular_file(full_path)) {
-            auto file_stream_ptr = std::make_shared<std::ifstream>(full_path, std::ios::binary);
+                std::vector<char> buffer(file_size);
+                if (!file.read(buffer.data(), file_size)) {
+                    std::cerr << "ERROR: Failed to read small file: " << full_path.string() << std::endl;
+                    res->writeStatus("500 Internal Server Error")->end("File Read Error");
+                    return;
+                }
+                res->end(std::string_view(buffer.data(), file_size));
+                return;
+            }
 
-            if (file_stream_ptr->is_open()) {
-                file_stream_ptr->seekg(0, std::ios::end);
-                size_t file_size = file_stream_ptr->tellg();
-                file_stream_ptr->seekg(0, std::ios::beg);
+            // For medium files, use buffered chunked transfer
+            if (file_size <= MMAP_THRESHOLD) {
+                auto file_stream_ptr = std::make_shared<std::ifstream>(
+                    full_path, std::ios::binary
+                );
+                
+                if (!file_stream_ptr->is_open()) {
+                    std::cerr << "ERROR: Could not open medium file: " << full_path.string() << std::endl;
+                    res->writeStatus("500 Internal Server Error")->end("Could not open file");
+                    return;
+                }
 
-                // std::cout << "[File Open] File '" << full_path.string() << "' opened successfully. Size: " << file_size << " bytes." << std::endl;
+                auto buffer_ptr = std::make_shared<std::vector<char>>(LARGE_FILE_CHUNK_SIZE);
+                auto remaining_bytes = std::make_shared<size_t>(file_size);
+                auto transfer_start = std::chrono::steady_clock::now();
 
-                std::string mime_type = get_mime_type(full_path.string());
-                res->writeHeader("Content-Type", mime_type);
-                res->writeHeader("Content-Length", std::to_string(file_size));
-                // std::cout << "[Headers] Set Content-Type: " << mime_type << ", Content-Length: " << file_size << std::endl;
+                // Abort handler
+                res->onAborted([file_stream_ptr, full_path_str = full_path.string()]() {
+                    std::cerr << "WARNING: Transfer aborted for file: " << full_path_str << std::endl;
+                });
 
-                // Determine a reasonable max chunk size for a single write to avoid onWritable for small files
-                // UWS_MAX_SENDFILE_SIZE is not directly exposed to userland code like this.
-                // A common buffer size or even the system's socket buffer size can be a guide.
-                // Let's use 64KB as a heuristic for a "small" file that can be sent in one go.
-                const size_t SMALL_FILE_THRESHOLD = 64 * 1024; // 64 KB
+                // Chunked transfer handler
+                res->onWritable([res, file_stream_ptr, buffer_ptr, remaining_bytes, 
+                                transfer_start, full_path_str = full_path.string()](int /* offset */) mutable {
+                    // Check timeout
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - transfer_start).count() > TRANSFER_TIMEOUT_MS) {
+                        std::cerr << "ERROR: Transfer timeout reached for file: " << full_path_str << std::endl;
+                        res->writeStatus("500 Internal Server Error")->end("Transfer Timeout");
+                        return true;
+                    }
 
-                if (file_size <= SMALL_FILE_THRESHOLD) {
-                    // Read the entire small file into a buffer and send it all at once
-                    std::vector<char> buffer(file_size);
-                    if (!file_stream_ptr->read(buffer.data(), file_size)) {
-                        std::cerr << "ERROR: Failed to read entire small file: " << full_path.string() << std::endl;
+                    if (*remaining_bytes == 0) {
+                        // All data sent - end the response
+                        res->end();
+                        return true;
+                    }
+
+                    size_t chunk_size = std::min(buffer_ptr->size(), *remaining_bytes);
+                    if (!file_stream_ptr->read(buffer_ptr->data(), chunk_size)) {
+                        std::cerr << "ERROR: Failed to read chunk from file: " << full_path_str << std::endl;
+                        res->writeStatus("500 Internal Server Error")->end("File Read Error");
+                        return true;
+                    }
+
+                    bool write_success = res->write(std::string_view(buffer_ptr->data(), chunk_size));
+                    *remaining_bytes -= chunk_size;
+
+                    if (!write_success) {
+                        std::cerr << "WARNING: Write failed for file: " << full_path_str << std::endl;
+                        return true;
+                    }
+
+                    // Return true if we're done, false if more to send
+                    return *remaining_bytes == 0;
+                });
+
+                // Send first chunk
+                size_t first_chunk = std::min(buffer_ptr->size(), file_size);
+                if (first_chunk > 0) {
+                    if (!file_stream_ptr->read(buffer_ptr->data(), first_chunk)) {
+                        std::cerr << "ERROR: Failed to read first chunk from file: " << full_path.string() << std::endl;
                         res->writeStatus("500 Internal Server Error")->end("File Read Error");
                         return;
                     }
-                    // std::cout << "[Small File] Sending entire file (" << file_size << " bytes) in one go." << std::endl;
-                    res->end(std::string_view(buffer.data(), file_size));
-                    // No need for onWritable or explicit res->write, res->end(data) sends it all.
-                } else {
-                    // File is large, use onWritable for chunking
-                    auto buffer_ptr = std::make_shared<std::vector<char>>(16 * 1024); // 16KB buffer for chunks
+                    res->write(std::string_view(buffer_ptr->data(), first_chunk));
+                }
+            }
+            // For very large files (above MMAP_THRESHOLD), use memory-mapped I/O
+            else {
+                try {
+                    auto mapped_file = std::make_shared<MappedFile>(full_path.string());
+                    auto remaining_bytes = std::make_shared<size_t>(mapped_file->getSize());
+                    auto transfer_start = std::chrono::steady_clock::now();
 
-                    res->onWritable([res, file_stream_ptr, buffer_ptr, remaining_bytes_captured = file_size](int offset) mutable {
-                        std::cout << "[onWritable] Called. Offset: " << offset << ", Remaining bytes (before this chunk): " << remaining_bytes_captured << std::endl;
-
-                        size_t chunk_to_read = std::min((size_t)offset, remaining_bytes_captured);
-
-                        if (chunk_to_read == 0) {
-                            std::cout << "[onWritable] No bytes to read in this chunk (chunk_to_read is 0)." << std::endl;
-                            if (remaining_bytes_captured == 0) {
-                                std::cout << "[onWritable] All bytes sent, calling res->end()." << std::endl;
-                                res->end(); // Important: End the response here if all is sent
-                            }
-                            return true; // Indicate that no more data is immediately available to write
-                        }
-
-                        if (!file_stream_ptr->read(buffer_ptr->data(), chunk_to_read)) {
-                            std::cerr << "ERROR: [onWritable] File read error or EOF unexpectedly! File: (Check if stream is still valid: " << file_stream_ptr->good() << ")" << std::endl;
-                            res->end(); // Attempt to gracefully close the response on read error
-                            return true; // Stop writing
-                        }
-
-                        remaining_bytes_captured -= chunk_to_read;
-                        res->write(std::string_view(buffer_ptr->data(), chunk_to_read));
-                        std::cout << "[onWritable] Wrote " << chunk_to_read << " bytes. Remaining: " << remaining_bytes_captured << std::endl;
-
-                        if (remaining_bytes_captured == 0) {
-                            std::cout << "[onWritable] Last chunk sent, calling res->end()." << std::endl;
-                            res->end(); // Important: End the response once all data is sent
-                        }
-                        return remaining_bytes_captured == 0; // Return true if done, false otherwise
-                    })->onAborted([file_stream_ptr, full_path_str = full_path.string()]() {
-                        std::cerr << "WARNING: Static file transfer aborted for '" << full_path_str << "'." << std::endl;
+                    // Abort handler
+                    res->onAborted([mapped_file, full_path_str = full_path.string()]() {
+                        std::cerr << "WARNING: Transfer aborted for file: " << full_path_str << std::endl;
                     });
 
-                    // Send the first chunk for large files
-                    size_t first_chunk_size = std::min(buffer_ptr->size(), file_size);
-                    if (first_chunk_size > 0) {
-                        std::cout << "[Initial Write] Sending first chunk of size: " << first_chunk_size << " for large file." << std::endl;
-                        if (!file_stream_ptr->read(buffer_ptr->data(), first_chunk_size)) {
-                             std::cerr << "ERROR: [Initial Write] File read error for first chunk of large file! File: " << full_path.string() << std::endl;
-                             res->end();
-                             return;
+                    // Chunked transfer handler using memory-mapped file
+                    res->onWritable([res, mapped_file, remaining_bytes, 
+                                    transfer_start, full_path_str = full_path.string()](int /* offset */) mutable {
+                        // Check timeout
+                        auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - transfer_start).count() > TRANSFER_TIMEOUT_MS) {
+                            std::cerr << "ERROR: Transfer timeout reached for file: " << full_path_str << std::endl;
+                            res->writeStatus("500 Internal Server Error")->end("Transfer Timeout");
+                            return true;
                         }
-                        res->write(std::string_view(buffer_ptr->data(), first_chunk_size));
-                    }
-                    std::cout << "[Initial Write] More data to send. onWritable will continue for large file." << std::endl;
-                }
 
-            } else {
-                std::cerr << "ERROR: Could not open file for reading: " << full_path.string() << std::endl;
-                res->writeStatus("500 Internal Server Error")->end("Could not open file.");
+                        if (*remaining_bytes == 0) {
+                            // All data sent - end the response
+                            res->end();
+                            return true;
+                        }
+
+                        size_t chunk_size = std::min(LARGE_FILE_CHUNK_SIZE, *remaining_bytes);
+                        const char* chunk_start = mapped_file->getData() + (mapped_file->getSize() - *remaining_bytes);
+
+                        bool write_success = res->write(std::string_view(chunk_start, chunk_size));
+                        *remaining_bytes -= chunk_size;
+
+                        if (!write_success) {
+                            std::cerr << "WARNING: Write failed for file: " << full_path_str << std::endl;
+                            return true;
+                        }
+
+                        // Return true if we're done, false if more to send
+                        return *remaining_bytes == 0;
+                    });
+
+                    // Send first chunk
+                    size_t first_chunk = std::min(LARGE_FILE_CHUNK_SIZE, mapped_file->getSize());
+                    if (first_chunk > 0) {
+                        res->write(std::string_view(mapped_file->getData(), first_chunk));
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "ERROR: Failed to memory-map file " << full_path.string() 
+                              << ": " << e.what() << std::endl;
+                    res->writeStatus("500 Internal Server Error")->end("File Read Error");
+                }
             }
-        } else {
-            std::cout << "[File Check] File not found or not a regular file: " << full_path.string() << std::endl;
-            res->writeStatus("404 Not Found")->end("Not Found");
+
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: Exception in static file handler: " << e.what() << std::endl;
+            if (!res->hasResponded()) {
+                res->writeStatus("500 Internal Server Error")->end("Internal Server Error");
+            }
         }
     });
 
@@ -1188,7 +1262,6 @@ int uw_serve_static(lua_State *L) {
     return 1;
 }
 
-// --- SSE Implementation ---
 
 // Lua callable function to send an SSE event
 // Expected usage: uwebsockets.sse_send(sse_id, data, event_name_optional, id_optional)
@@ -1279,7 +1352,6 @@ int uw_sse(lua_State *L) {
 
         // Generate a unique ID for this SSE connection
         std::string sse_id = generate_unique_id();
-        std::cout << "New SSE connection established: " << sse_id << " for route: " << route << std::endl;
 
         // Set SSE specific headers
         res->writeHeader("Content-Type", "text/event-stream");
@@ -1595,77 +1667,500 @@ int uw_sync_write_file(lua_State *L) {
 }
 
 
-int uw_listen(lua_State *L) {
+// Add near top with other declarations
+struct LuaTimer {
+    int timer_id;
+    bool is_interval;
+    int callback_ref;
+    std::vector<int> arg_refs;
+    bool active;
+    std::chrono::milliseconds interval;
+    std::chrono::steady_clock::time_point next_execution;
+};
+
+static std::unordered_map<int, LuaTimer> active_timers;
+static std::mutex timers_mutex;
+static int next_timer_id = 1;
+static void* timer_handler_key = nullptr;
+static bool timers_initialized = false;
+static int cleanup_callback_ref = LUA_NOREF;
+
+// Helper to call Lua timer callbacks
+static void call_timer_callback(int timer_id) {
+    std::lock_guard<std::mutex> lua_lock(lua_mutex);
+    std::lock_guard<std::mutex> timer_lock(timers_mutex);
+    
+    auto it = active_timers.find(timer_id);
+    if (it == active_timers.end() || !it->second.active) {
+        return;
+    }
+    
+    LuaTimer& timer = it->second;
+    
+    lua_rawgeti(main_L, LUA_REGISTRYINDEX, timer.callback_ref);
+    
+    for (int arg_ref : timer.arg_refs) {
+        lua_rawgeti(main_L, LUA_REGISTRYINDEX, arg_ref);
+    }
+    
+    if (lua_pcall(main_L, timer.arg_refs.size(), 0, 0) != LUA_OK) {
+        std::cerr << "Timer callback error: " << lua_tostring(main_L, -1) << std::endl;
+        lua_pop(main_L, 1);
+    }
+    
+    if (timer.is_interval) {
+        timer.next_execution = std::chrono::steady_clock::now() + timer.interval;
+    } else {
+        timer.active = false;
+    }
+}
+
+// Timer check function
+static void check_timers() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<int> timers_to_execute;
+    
+    {
+        std::lock_guard<std::mutex> lock(timers_mutex);
+        for (auto& pair : active_timers) {
+            if (pair.second.active && now >= pair.second.next_execution) {
+                timers_to_execute.push_back(pair.first);
+            }
+        }
+    }
+    
+    for (int timer_id : timers_to_execute) {
+        call_timer_callback(timer_id);
+    }
+    
+    // Clean up inactive timers
+    {
+        std::lock_guard<std::mutex> lock(timers_mutex);
+        for (auto it = active_timers.begin(); it != active_timers.end(); ) {
+            if (!it->second.active) {
+                luaL_unref(main_L, LUA_REGISTRYINDEX, it->second.callback_ref);
+                for (int arg_ref : it->second.arg_refs) {
+                    luaL_unref(main_L, LUA_REGISTRYINDEX, arg_ref);
+                }
+                it = active_timers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+// Initialize timer system
+static void init_timer_system() {
+    if (!timers_initialized && uWS::Loop::get()) {
+        timer_handler_key = new int(0);
+        uWS::Loop::get()->addPostHandler(timer_handler_key, [](uWS::Loop* loop) {
+            check_timers();
+        });
+        timers_initialized = true;
+    }
+}
+
+// Shutdown timer system
+static void shutdown_timer_system() {
+    if (timers_initialized) {
+        if (uWS::Loop::get() && timer_handler_key) {
+            uWS::Loop::get()->removePostHandler(timer_handler_key);
+        }
+        
+        // Clean up any remaining timers
+        {
+            std::lock_guard<std::mutex> lock(timers_mutex);
+            for (auto& pair : active_timers) {
+                luaL_unref(main_L, LUA_REGISTRYINDEX, pair.second.callback_ref);
+                for (int arg_ref : pair.second.arg_refs) {
+                    luaL_unref(main_L, LUA_REGISTRYINDEX, arg_ref);
+                }
+            }
+            active_timers.clear();
+        }
+        
+        delete static_cast<int*>(timer_handler_key);
+        timer_handler_key = nullptr;
+        timers_initialized = false;
+    }
+}
+
+// Common function to create timers
+static int create_timer(lua_State* L, bool is_interval) {
     if (!app) {
-        std::cerr << "Error: uWS::App not initialized." << std::endl;
-        lua_pushboolean(L, 0);
-        return 1;
+        luaL_error(L, "uWS::App not initialized. Call create_app first.");
+        return 0;
+    }
+    
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    int delay = luaL_checkinteger(L, 2);
+    
+    lua_pushvalue(L, 1);
+    int callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    
+    std::vector<int> arg_refs;
+    int num_args = lua_gettop(L);
+    for (int i = 3; i <= num_args; i++) {
+        lua_pushvalue(L, i);
+        arg_refs.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+    }
+    
+    LuaTimer timer;
+    timer.timer_id = next_timer_id++;
+    timer.is_interval = is_interval;
+    timer.callback_ref = callback_ref;
+    timer.arg_refs = std::move(arg_refs);
+    timer.active = true;
+    timer.interval = std::chrono::milliseconds(delay);
+    timer.next_execution = std::chrono::steady_clock::now() + timer.interval;
+    
+    {
+        std::lock_guard<std::mutex> lock(timers_mutex);
+        active_timers[timer.timer_id] = timer;
+    }
+    
+    // Ensure timer system is initialized
+    init_timer_system();
+    
+    lua_pushinteger(L, timer.timer_id);
+    return 1;
+}
+
+// Clear a timer
+static int clear_timer(lua_State* L) {
+    int timer_id = luaL_checkinteger(L, 1);
+    
+    std::lock_guard<std::mutex> lock(timers_mutex);
+    auto it = active_timers.find(timer_id);
+    if (it != active_timers.end()) {
+        it->second.active = false;
+    }
+    
+    return 0;
+}
+
+// Lua interface functions
+int uw_setTimeout(lua_State *L) {
+    return create_timer(L, false);
+}
+
+int uw_setInterval(lua_State *L) {
+    return create_timer(L, true);
+}
+
+int uw_clearTimer(lua_State *L) {
+    return clear_timer(L);
+}
+
+int uw_cleanup_app(lua_State *L) {
+    std::cout << "Cleaning up the uWS app instance..." << std::endl;
+
+    // Explicitly close the listening socket if active
+    if (listen_socket) {
+        us_listen_socket_close(0, listen_socket);
+        listen_socket = nullptr;
+        std::cout << "🔒 Listening socket closed" << std::endl;
     }
 
-    int port = luaL_checkinteger(L, 1);
-    app->listen(port, [L, port](auto *token) {
-        std::lock_guard<std::mutex> lock(lua_mutex);
-        if (token) {
-            std::cout << "Listening on port " << port << std::endl;
-        } else {
-            std::cerr << "Failed to listen on port " << port << std::endl;
-        }
-    });
+    // Destroy the uWS::App instance
+    if (app) {
+        app.reset();
+        std::cout << "🗑️ uWS::App destroyed" << std::endl;
+    }
 
     return 0;
 }
+
+
+
+
+
+
+
+// int uw_listen(lua_State *L) {
+//     if (!app) {
+//         std::cerr << "Error: uWS::App not initialized." << std::endl;
+//         lua_pushboolean(L, 0);
+//         return 1;
+//     }
+
+//     int port = luaL_checkinteger(L, 1);
+//     app->listen(port, [L, port](auto *token) {
+//         std::lock_guard<std::mutex> lock(lua_mutex);
+//         if (token) {
+//             std::cout << "Listening on port " << port << std::endl;
+//         } else {
+//             std::cerr << "Failed to listen on port " << port << std::endl;
+//         }
+//     });
+
+//     return 0;
+// }
 
 int uw_run(lua_State *L) {
     if (!app) {
         std::cerr << "Error: uWS::App not initialized. Call create_app first." << std::endl;
         return 0;
     }
+     // Initialize timer system if not already done
+    init_timer_system();
+    
     app->run();
+    
+    // Call cleanup callback if set
+    if (cleanup_callback_ref != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, cleanup_callback_ref);
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            std::cerr << "Cleanup callback error: " << lua_tostring(L, -1) << std::endl;
+            lua_pop(L, 1);
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, cleanup_callback_ref);
+        cleanup_callback_ref = LUA_NOREF;
+    }
+    
+    // Clean up everything
+    shutdown_timer_system();
+    if (app) {
+        app.reset();
+    }
+    
     return 0;
 }
 
-int uw_cleanup_app(lua_State *L) {
-    if (app) {
-        std::cout << "Explicitly resetting uWS::App shared_ptr.\n";
-        app.reset(); // This will call the destructor of uWS::App
+int uw_listen(lua_State *L) {
+    if (!app) {
+        luaL_error(L, "uWS::App not initialized. Call create_app first.");
+        return 0;
     }
-    main_L = nullptr; // Reset main_L if needed
+
+    int port = luaL_checkinteger(L, 1);
+
+    app->listen(port, [L, port](auto *token) {
+        std::lock_guard<std::mutex> lock(lua_mutex);
+        listen_socket = token;
+
+        if (token) {
+            std::cout << "✅ Listening on port " << port << std::endl;
+
+            if (lua_gettop(L) > 1 && lua_isfunction(L, 2)) {
+                lua_pushvalue(L, 2);
+                if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+                    std::cerr << "Listen callback error: " << lua_tostring(L, -1) << std::endl;
+                    lua_pop(L, 1);
+                }
+            }
+        } else {
+            std::cerr << "❌ Failed to listen on port " << port << std::endl;
+        }
+    });
+
+    // ⚠️ DO NOT run loop here — defer it to uw_run()
     return 0;
 }
+
+int uw_restart_cleanup(lua_State *L) {
+    uWS::Loop::get()->defer([]() {
+        std::cout << "[restart_cleanup] Cleaning up server..." << std::endl;
+
+        shutdown_timer_system();
+
+        {
+            std::lock_guard<std::mutex> lock(sse_connections_mutex);
+            for (auto &p : active_sse_connections) {
+                auto &conn = p.second;
+                if (conn && !conn->is_aborted && conn->res) {
+                    conn->res->end();
+                    conn->is_aborted = true;
+                }
+            }
+            active_sse_connections.clear();
+        }
+
+        if (listen_socket) {
+            us_listen_socket_close(0, listen_socket);
+            listen_socket = nullptr;
+        }
+
+        if (app) {
+            app.reset();
+        }
+    });
+
+    return 0; // tell Lua "no return values"
+
+}
+// declare uw_restart_reregister before ninitalization
+   static int uw_restart_reregister(lua_State *L);
+
+// Forward decl from uw_create_app
+static int app_userdata_gc(lua_State *L);
+
+static void create_app_metatable(lua_State *L) {
+    luaL_newmetatable(L, "uWS.App");
+
+    // Methods table
+    lua_newtable(L);
+
+    // Register methods on the App object
+    lua_pushcfunction(L, uw_get);           lua_setfield(L, -2, "get");
+    lua_pushcfunction(L, uw_post);          lua_setfield(L, -2, "post");
+    lua_pushcfunction(L, uw_put);           lua_setfield(L, -2, "put");
+    lua_pushcfunction(L, uw_delete);        lua_setfield(L, -2, "delete");
+    lua_pushcfunction(L, uw_patch);         lua_setfield(L, -2, "patch");
+    lua_pushcfunction(L, uw_head);          lua_setfield(L, -2, "head");
+    lua_pushcfunction(L, uw_options);       lua_setfield(L, -2, "options");
+    lua_pushcfunction(L, uw_ws);            lua_setfield(L, -2, "ws");
+
+    lua_pushcfunction(L, uw_sse);           lua_setfield(L, -2, "sse");
+    lua_pushcfunction(L, uw_sse_send);      lua_setfield(L, -2, "sse_send");
+    lua_pushcfunction(L, uw_sse_close);     lua_setfield(L, -2, "sse_close");
+
+    lua_pushcfunction(L, uw_use);           lua_setfield(L, -2, "use");
+    lua_pushcfunction(L, uw_serve_static);  lua_setfield(L, -2, "serve_static");
+
+    lua_pushcfunction(L, uw_setTimeout);    lua_setfield(L, -2, "setTimeout");
+    lua_pushcfunction(L, uw_setInterval);   lua_setfield(L, -2, "setInterval");
+    lua_pushcfunction(L, uw_clearTimer);    lua_setfield(L, -2, "clearTimer");
+
+    lua_pushcfunction(L, uw_listen);        lua_setfield(L, -2, "listen");
+    lua_pushcfunction(L, uw_run);           lua_setfield(L, -2, "run");
+    lua_pushcfunction(L, uw_cleanup_app);   lua_setfield(L, -2, "cleanup_app");
+    // lua_pushcfunction(L, uw_force_restart);      lua_setfield(L, -2, "restart");
+    lua_pushcfunction(L, uw_restart_cleanup); lua_setfield(L, -2, "restart_cleanup");
+    lua_pushcfunction(L, uw_restart_reregister); lua_setfield(L, -2, "restart_reregister");
+
+    // File I/O methods too if you want them on app
+    lua_pushcfunction(L, uw_async_read_file);  lua_setfield(L, -2, "async_read_file");
+    lua_pushcfunction(L, uw_async_write_file); lua_setfield(L, -2, "async_write_file");
+    lua_pushcfunction(L, uw_sync_read_file);   lua_setfield(L, -2, "sync_read_file");
+    lua_pushcfunction(L, uw_sync_write_file);  lua_setfield(L, -2, "sync_write_file");
+
+    // set __index = methods table
+    lua_setfield(L, -2, "__index");
+
+    // Add __gc metamethod so shared_ptr is destroyed when Lua collects
+    lua_pushcfunction(L, app_userdata_gc);
+    lua_setfield(L, -2, "__gc");
+
+    lua_pop(L, 1); // pop metatable
+}
+
+// Helper: destructor for the app userdata (called by Lua GC)
+static int app_userdata_gc(lua_State *L) {
+    void* ud = lua_touserdata(L, 1);
+    if (!ud) return 0;
+    // Call destructor explicitly
+    std::shared_ptr<uWS::App>* ptr = static_cast<std::shared_ptr<uWS::App>*>(ud);
+    ptr->~shared_ptr<uWS::App>();
+    return 0;
+}
+
+int uw_create_app(lua_State *L) {
+    if (!app) {
+        app = std::make_shared<uWS::App>();
+        main_L = L;
+    }
+
+    // Allocate userdata sized for a shared_ptr
+    void* ud = lua_newuserdata(L, sizeof(std::shared_ptr<uWS::App>));
+    new (ud) std::shared_ptr<uWS::App>(app); // placement-new construct shared_ptr
+
+    // Ensure the metatable exists
+    luaL_getmetatable(L, "uWS.App");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);            // remove nil
+        create_app_metatable(L);  // define it
+        luaL_getmetatable(L, "uWS.App"); // push it again
+    }
+
+    // Set the metatable on userdata
+    lua_setmetatable(L, -2);
+
+    return 1;
+}
+
+
+
+int uw_restart_reregister(lua_State *L) {
+    int port = luaL_checkinteger(L, 1);
+
+    int cb_ref = LUA_NOREF;
+    if (lua_gettop(L) >= 2 && lua_isfunction(L, 2)) {
+        lua_pushvalue(L, 2);
+        cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    uWS::Loop::get()->defer([port, cb_ref]() {
+        app = std::make_shared<uWS::App>();
+        init_timer_system();
+
+        if (main_L) {
+            std::lock_guard<std::mutex> lock(lua_mutex);
+            lua_getglobal(main_L, "on_restart_register");
+            if (lua_isfunction(main_L, -1)) {
+                // Create a proper app userdata with the same metatable as uw_create_app
+                void* ud = lua_newuserdata(main_L, sizeof(std::shared_ptr<uWS::App>));
+                new (ud) std::shared_ptr<uWS::App>(app); // placement-new construct shared_ptr
+                
+                // Set the same metatable used by uw_create_app
+                luaL_getmetatable(main_L, "uWS.App");
+                lua_setmetatable(main_L, -2);
+                
+                if (lua_pcall(main_L, 1, 0, 0) != LUA_OK) {
+                    std::cerr << "[restart_reregister] Lua error: "
+                              << lua_tostring(main_L, -1) << std::endl;
+                    lua_pop(main_L, 1);
+                }
+            } else {
+                lua_pop(main_L, 1);
+                std::cerr << "[restart_reregister] No Lua on_restart_register() found" << std::endl;
+            }
+        }
+
+        // Now listen
+        app->listen(port, [port, cb_ref](auto *token) {
+            std::lock_guard<std::mutex> lock(lua_mutex);
+
+            if (token) {
+                listen_socket = token;
+                std::cout << "[restart_reregister] Listening on port " << port << std::endl;
+
+                if (cb_ref != LUA_NOREF && main_L) {
+                    lua_rawgeti(main_L, LUA_REGISTRYINDEX, cb_ref);
+                    lua_pushboolean(main_L, 1);
+                    lua_pushnil(main_L);
+                    lua_pcall(main_L, 2, 0, 0);
+                    luaL_unref(main_L, LUA_REGISTRYINDEX, cb_ref);
+                }
+            } else {
+                std::cerr << "[restart_reregister] Failed to bind" << std::endl;
+                if (cb_ref != LUA_NOREF && main_L) {
+                    lua_rawgeti(main_L, LUA_REGISTRYINDEX, cb_ref);
+                    lua_pushboolean(main_L, 0);
+                    lua_pushstring(main_L, "bind failed");
+                    lua_pcall(main_L, 2, 0, 0);
+                    luaL_unref(main_L, LUA_REGISTRYINDEX, cb_ref);
+                }
+            }
+        });
+    });
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 
 extern "C" int luaopen_uwebsockets(lua_State *L) {
-    create_metatables(L);
+    create_metatables(L);     // req, res, websocket
+    create_app_metatable(L);  // app
 
     luaL_Reg functions[] = {
         {"create_app", uw_create_app},
-        {"get", uw_get},
-        {"post", uw_post},
-        {"put", uw_put},
-        {"delete", uw_delete},
-        {"patch", uw_patch},
-        {"head", uw_head},
-        {"options", uw_options},
-        {"ws", uw_ws},
-        {"sse", uw_sse},             // New SSE route function
-        {"sse_send", uw_sse_send},   // New function to send SSE data
-        {"sse_close", uw_sse_close}, // New function to close SSE connection
-        {"listen", uw_listen},
-        {"run", uw_run},
-        {"use", uw_use},
-        {"serve_static", uw_serve_static},
-        {"setTimeout", uw_setTimeout},
-        {"setInterval", uw_setInterval},
-        {"clearTimer", uw_clearTimer},
-        {"cleanup_app", uw_cleanup_app}, // Add this new function
-        {"async_read_file", uw_async_read_file},
-        {"async_write_file", uw_async_write_file},
-        {"sync_read_file", uw_sync_read_file},
-        {"sync_write_file", uw_sync_write_file},
-
-        // {"add_timer", uw_add_timer}, // This function was not defined in the provided shim.cpp
         {nullptr, nullptr}
     };
 
     luaL_newlib(L, functions);
     return 1;
 }
+
